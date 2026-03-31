@@ -1,0 +1,34 @@
+LAMBDA TEST COMMAND PAYLOAD
+===========================
+
+This is the JSON shape now sent by:
+  python /app/webcam_monitor.py --lambdatest
+
+The `--lambdatest` command now sends the same payload as the nightly webhook report.
+The values below are representative examples.
+
+{
+  "source": "UMCI Camera Monitor",
+  "event": "daily_report",
+  "report_date": "2026-03-30",
+  "text": "UMCI Camera Monitor daily report for 2026-03-30\n\nOK               -  02:30 HR\nPower Saver      -  10:30 HR\nLow Power        -  09:15 HR\nNo Power         -  00:00 HR\n\nThere were 15 minutes less low power time than yesterday.\nThere were 0 minutes the same as yesterday of no power time.\nIt has been 18:45 since the last no power event.",
+  "html": "<html><body style=\"font-family: Arial, sans-serif; color: #222;\"><h2 style=\"margin-bottom: 8px;\">UMCI Camera Monitor daily report for 2026-03-30</h2><table style=\"border-collapse: collapse; margin-bottom: 16px;\"><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">OK</td><td style=\"padding: 4px 0;\">02:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Power Saver</td><td style=\"padding: 4px 0;\">10:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Low Power</td><td style=\"padding: 4px 0;\">09:15 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">No Power</td><td style=\"padding: 4px 0;\">00:00 HR</td></tr></table><p style=\"margin: 0 0 8px 0;\"><span style=\"color: #2e7d32; font-weight: 600;\">There were 15 minutes less low power time than yesterday.</span></p><p style=\"margin: 0 0 16px 0;\"><span style=\"color: #333333; font-weight: 600;\">There were 0 minutes the same as yesterday of no power time.</span></p><p style=\"margin: 0 0 16px 0;\">It has been 18:45 since the last no power event.</p><img src=\"cid:webcam_chart_inline\" alt=\"Webcam status chart\" style=\"max-width: 100%; height: auto; border: 1px solid #ddd;\" /></body></html>"
+}
+
+
+LAMBDA POWER FAILURE ALERT PAYLOAD
+==================================
+
+This is the JSON shape sent when the no-power alert threshold is exceeded,
+or when:
+  python /app/webcam_monitor.py --alerttest
+
+The values below are representative examples.
+
+{
+  "source": "UMCI Camera Monitor",
+  "event": "power_failure_alert",
+  "report_date": "2026-03-31",
+  "text": "@here\nALERT: Power failure threshold exceeded for 2026-03-31.\n\nDaily accumulated no power time: 03:15 HR\nExpected power-on time: 09:45 HR\nAlert threshold: 03:13 HR\n",
+  "html": "<p style=\"color: #c62828; font-weight: 700;\">@here</p><html><body style=\"font-family: Arial, sans-serif; color: #222;\"><p style=\"margin: 0 0 16px 0; color: #c62828; font-weight: 700;\">ALERT: Power failure threshold exceeded for 2026-03-31.</p><p style=\"margin: 0 0 8px 0;\">Daily accumulated no power time: <strong>03:15 HR</strong></p><p style=\"margin: 0 0 8px 0;\">Expected power-on time: <strong>09:45 HR</strong></p><p style=\"margin: 0 0 16px 0;\">Alert threshold: <strong>03:13 HR</strong></p></body></html>"
+}

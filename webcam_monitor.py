@@ -1,0 +1,1258 @@
+#!/usr/bin/env python3
+"""
+Webcam Monitor — U-M Center for Innovation Construction Camera
+==============================================================
+Monitors an HLS live stream every 15 minutes, classifies the camera state,
+logs results, and generates a timeline chart.
+
+States
+------
+  Online - OK          (green)  : Stream live, no low-power overlay.
+  Online - Low Power   (yellow) : Stream live, red "low power" text overlay.
+  Offline - No Power   (red)    : Stream down during daylight hours.
+  Offline - PowerSaving (black) : Stream down during nighttime.
+
+Daylight is defined relative to the camera location (Ann Arbor, MI):
+  Daylight start = dawn  minus 10 minutes
+  Daylight end   = dusk  minus  5 minutes
+
+Usage
+-----
+  python webcam_monitor.py              # Run one check now
+  python webcam_monitor.py --loop       # Run continuously every 15 minutes
+  python webcam_monitor.py --chart      # Regenerate the chart from the log
+  python webcam_monitor.py --chart 14   # Chart for the last 14 days
+  python webcam_monitor.py --daily-report     # Send chart + log to Slack
+  python webcam_monitor.py --daily-email-report  # Email chart + logs
+  python webcam_monitor.py --lambdatest  # Send the nightly webhook report now
+  python webcam_monitor.py --alerttest  # Send a no-power alert test
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import html
+import io
+import json
+import logging
+import mimetypes
+import os
+import smtplib
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfoNotFoundError
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.patches as mpatches
+from matplotlib.collections import PolyCollection
+
+import numpy as np
+from PIL import Image
+
+try:
+    from astral import LocationInfo
+    from astral.sun import sun
+except ImportError:
+    sys.exit("Missing dependency: pip install astral")
+
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: pip install requests")
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+STREAM_URL = (
+    "https://558312d54930d.streamlock.net"
+    "/live/umci.fois.axis.stream/playlist.m3u8"
+)
+
+# Camera location — Ann Arbor, MI
+LATITUDE  = 42.325
+LONGITUDE = -83.05
+TIMEZONE  = "America/New_York"  # preferred IANA name for compatibility
+
+# Paths — use MONITOR_DATA_DIR env var if set (e.g. inside Docker),
+# otherwise default to the same directory as this script.
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR   = Path(os.environ.get("MONITOR_DATA_DIR", str(SCRIPT_DIR)))
+LOG_FILE   = DATA_DIR / "webcam_log.csv"
+CHART_FILE = DATA_DIR / "webcam_chart.png"
+DIAGNOSTICS_FILE = DATA_DIR / "webcam_stream_diagnostics.csv"
+REPORT_STATE_FILE = DATA_DIR / "daily_report_state.json"
+
+CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+CHECK_TARGET_SECOND = 50
+DEFAULT_CHART_DAYS = 14
+CAMERA_TRANSITION_GRACE_MINUTES = 15
+NO_POWER_ALERT_THRESHOLD_FRACTION = 0.33
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
+SLACK_REPORT_NAME = os.environ.get("SLACK_REPORT_NAME", "UMCI Camera Monitor").strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USERNAME).strip()
+EMAIL_TO = os.environ.get("EMAIL_TO", "").strip()
+SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+LAMBDA_WEBHOOK_URL = os.environ.get(
+    "LAMBDA_WEBHOOK_URL",
+    "https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook",
+).strip()
+
+# How many seconds ffmpeg is allowed to attempt frame capture
+FFMPEG_TIMEOUT = 20
+
+# Detection thresholds for "low power" red text
+# We look at the top-left overlay region of the captured frame
+RED_HUE_RANGE   = (340, 20)   # Hue wraps around 0/360
+RED_SAT_MIN     = 80          # Minimum saturation (0-255)
+RED_VAL_MIN     = 80          # Minimum value/brightness (0-255)
+RED_PIXEL_RATIO = 0.005       # >0.5% red pixels in overlay region → low power
+
+# ─── State constants ──────────────────────────────────────────────────────────
+
+STATE_ONLINE_OK       = "Online - OK"
+STATE_ONLINE_LOWPOWER = "Online - Low Power"
+STATE_OFFLINE_NOPOWER = "Offline - No Power"
+STATE_OFFLINE_SAVING  = "Offline - PowerSaving"
+
+STATE_COLORS = {
+    STATE_ONLINE_OK:       "#22c55e",  # green
+    STATE_ONLINE_LOWPOWER: "#eab308",  # yellow
+    STATE_OFFLINE_NOPOWER: "#ef4444",  # red
+    STATE_OFFLINE_SAVING:  "#c0c0c0",  # gray
+}
+
+# ─── Logging setup ────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("webcam_monitor")
+
+# ─── Solar calculations ──────────────────────────────────────────────────────
+
+def get_daylight_window(dt: datetime) -> tuple[datetime, datetime]:
+    """Return (daylight_start, daylight_end) for the given date.
+
+    daylight_start = dawn  - 10 minutes
+    daylight_end   = dusk  -  5 minutes
+    """
+    loc = LocationInfo(
+        name="Ann Arbor",
+        region="US",
+        timezone=TIMEZONE,
+        latitude=LATITUDE,
+        longitude=LONGITUDE,
+    )
+    try:
+        s = sun(loc.observer, date=dt.date(), tzinfo=TIMEZONE)
+    except ZoneInfoNotFoundError:
+        log.warning("Time zone %s not found (ZoneInfo), falling back to UTC", TIMEZONE)
+        s = sun(loc.observer, date=dt.date(), tzinfo="UTC")
+    dawn = s["dawn"].replace(tzinfo=None)
+    dusk = s["dusk"].replace(tzinfo=None)
+    return (dawn - timedelta(minutes=10), dusk - timedelta(minutes=5))
+
+
+def is_daylight(dt: datetime) -> bool:
+    """Return True if *dt* falls within the daylight window."""
+    start, end = get_daylight_window(dt)
+    return start <= dt <= end
+
+
+def classify_daylight_phase(dt: datetime) -> str:
+    """Return one of: nighttime, transition, daylight.
+
+    The camera only appears to evaluate its own power state on a 15-minute cadence,
+    so immediately after the adjusted dawn boundary and immediately before the
+    adjusted dusk boundary we treat an offline camera as transitional rather than
+    definitively "no power".
+    """
+    start, end = get_daylight_window(dt)
+    grace = timedelta(minutes=CAMERA_TRANSITION_GRACE_MINUTES)
+
+    if dt < start or dt > end:
+        return "nighttime"
+    if dt < start + grace or dt > end - grace:
+        return "transition"
+    return "daylight"
+
+# ─── Stream checks ───────────────────────────────────────────────────────────
+
+def check_stream_available(timeout: int = 10) -> tuple[bool, dict[str, str]]:
+    """Return stream availability plus diagnostic details for the HLS URL."""
+    try:
+        resp = requests.get(STREAM_URL, timeout=timeout)
+        playlist_ok = resp.status_code == 200 and "#EXTM3U" in resp.text[:256]
+        details = {
+            "http_status": str(resp.status_code),
+            "content_type": resp.headers.get("Content-Type", ""),
+            "content_encoding": resp.headers.get("Content-Encoding", ""),
+            "playlist_ok": str(playlist_ok),
+            "request_error": "",
+        }
+        # A valid m3u8 starts with #EXTM3U. Use decoded response text so
+        # compressed responses (for example gzip) are handled correctly.
+        return playlist_ok, details
+    except Exception as exc:
+        log.debug("Stream check failed: %s", exc)
+        return False, {
+            "http_status": "",
+            "content_type": "",
+            "content_encoding": "",
+            "playlist_ok": "False",
+            "request_error": str(exc),
+        }
+
+
+def grab_frame() -> tuple[Optional[Image.Image], str]:
+    """Use ffmpeg to capture a single frame from the HLS stream.
+
+    Returns a PIL Image plus a short ffmpeg status string.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",                      # overwrite
+        "-loglevel", "error",
+        "-i", STREAM_URL,
+        "-frames:v", "1",          # grab one frame
+        "-f", "image2pipe",        # pipe raw image
+        "-vcodec", "png",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=FFMPEG_TIMEOUT,
+        )
+        if result.returncode != 0:
+            ffmpeg_error = result.stderr.decode(errors="replace")[:300].strip()
+            log.warning("ffmpeg error: %s", ffmpeg_error)
+            return None, ffmpeg_error
+        return Image.open(io.BytesIO(result.stdout)).convert("RGB"), "ok"
+    except subprocess.TimeoutExpired:
+        log.warning("ffmpeg timed out after %ds", FFMPEG_TIMEOUT)
+        return None, f"timeout after {FFMPEG_TIMEOUT}s"
+    except Exception as exc:
+        log.warning("Frame capture failed: %s", exc)
+        return None, str(exc)
+
+
+def detect_low_power(img: Image.Image) -> bool:
+    """Detect whether the frame contains a red 'low power' text overlay.
+
+    Examines the top-left region of the image (where the overlay appears)
+    and checks for a significant presence of red-hued pixels.
+    """
+    w, h = img.size
+    # Crop the overlay region: top-left ~40% width, top ~8% height
+    overlay = img.crop((0, 0, int(w * 0.4), int(h * 0.08)))
+
+    # Convert to HSV via numpy
+    arr = np.array(overlay).astype(np.float32)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    # Simple RGB-based red detection (more robust than HSV for overlays)
+    # Red text: high R, low G, low B
+    is_red = (r > 150) & (g < 100) & (b < 100)
+    ratio = np.count_nonzero(is_red) / is_red.size
+
+    log.debug("Red pixel ratio in overlay: %.4f (threshold: %.4f)", ratio, RED_PIXEL_RATIO)
+    return ratio > RED_PIXEL_RATIO
+
+# ─── State determination ─────────────────────────────────────────────────────
+
+def determine_state(now: Optional[datetime] = None) -> tuple[str, dict[str, str]]:
+    """Check the camera and return state plus stream diagnostics."""
+    if now is None:
+        now = datetime.now()
+
+    daylight_phase = classify_daylight_phase(now)
+    stream_up, diagnostics = check_stream_available()
+    diagnostics["is_daylight"] = str(daylight_phase != "nighttime")
+    diagnostics["daylight_phase"] = daylight_phase
+
+    if stream_up:
+        # Try to grab a frame and check for low-power overlay
+        frame, ffmpeg_status = grab_frame()
+        diagnostics["ffmpeg_status"] = ffmpeg_status
+        diagnostics["frame_captured"] = str(frame is not None)
+        if frame is not None and detect_low_power(frame):
+            return STATE_ONLINE_LOWPOWER, diagnostics
+        return STATE_ONLINE_OK, diagnostics
+    else:
+        # Offline — classify by time of day
+        diagnostics["ffmpeg_status"] = ""
+        diagnostics["frame_captured"] = "False"
+        if daylight_phase == "daylight":
+            return STATE_OFFLINE_NOPOWER, diagnostics
+        else:
+            return STATE_OFFLINE_SAVING, diagnostics
+
+# ─── CSV log ─────────────────────────────────────────────────────────────────
+
+def append_log(dt: datetime, state: str) -> None:
+    """Append a single entry to the CSV log."""
+    is_new = (not LOG_FILE.exists()) or LOG_FILE.stat().st_size == 0
+    with open(LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "state"])
+        writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S"), state])
+
+
+def append_diagnostics_log(dt: datetime, state: str, diagnostics: dict[str, str]) -> None:
+    """Append a single stream-diagnostics record to a separate CSV log."""
+    is_new = (not DIAGNOSTICS_FILE.exists()) or DIAGNOSTICS_FILE.stat().st_size == 0
+    with open(DIAGNOSTICS_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow([
+                "timestamp",
+                "state",
+                "is_daylight",
+                "daylight_phase",
+                "http_status",
+                "content_type",
+                "content_encoding",
+                "playlist_ok",
+                "frame_captured",
+                "ffmpeg_status",
+                "request_error",
+            ])
+        writer.writerow([
+            dt.strftime("%Y-%m-%d %H:%M:%S"),
+            state,
+            diagnostics.get("is_daylight", ""),
+            diagnostics.get("daylight_phase", ""),
+            diagnostics.get("http_status", ""),
+            diagnostics.get("content_type", ""),
+            diagnostics.get("content_encoding", ""),
+            diagnostics.get("playlist_ok", ""),
+            diagnostics.get("frame_captured", ""),
+            diagnostics.get("ffmpeg_status", ""),
+            diagnostics.get("request_error", ""),
+        ])
+
+
+def read_log() -> list[tuple[datetime, str]]:
+    """Read the full log and return a list of (datetime, state) tuples."""
+    if not LOG_FILE.exists():
+        return []
+    entries = []
+    timestamp_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y %H:%M:%S",
+    ]
+    with open(LOG_FILE, "r") as f:
+        reader = csv.reader(f)
+        first_row = next(reader, None)
+        rows = []
+        if first_row is not None:
+            if len(first_row) >= 2 and first_row[0] == "timestamp" and first_row[1] == "state":
+                rows = reader
+            else:
+                rows = [first_row, *reader]
+        for row in rows:
+            if len(row) >= 2:
+                for fmt in timestamp_formats:
+                    try:
+                        dt = datetime.strptime(row[0], fmt)
+                        entries.append((dt, row[1]))
+                        break
+                    except ValueError:
+                        continue
+    return entries
+
+
+def get_daily_state_minutes(entries: list[tuple[datetime, str]], target_date) -> dict[str, int]:
+    """Summarize one date into 15-minute totals per state."""
+    slots: dict[int, str] = {}
+    for dt, state in entries:
+        if dt.date() != target_date:
+            continue
+        slot = (dt.hour * 60 + dt.minute) // 15
+        slots[slot] = state
+
+    minutes = {
+        STATE_ONLINE_OK: 0,
+        STATE_ONLINE_LOWPOWER: 0,
+        STATE_OFFLINE_NOPOWER: 0,
+        STATE_OFFLINE_SAVING: 0,
+    }
+    for state in slots.values():
+        minutes[state] = minutes.get(state, 0) + 15
+    return minutes
+
+
+def get_expected_power_on_minutes(target_date) -> int:
+    """Return expected on-time minutes for a day based on the daylight window."""
+    midday = datetime.combine(target_date, datetime.min.time()).replace(hour=12)
+    start, end = get_daylight_window(midday)
+    minutes = max(0, int((end - start).total_seconds() // 60))
+    return minutes
+
+
+def get_no_power_alert_threshold_minutes(target_date) -> int:
+    """Return the no-power alert threshold in minutes for a date."""
+    expected_minutes = get_expected_power_on_minutes(target_date)
+    if expected_minutes <= 0:
+        return 0
+    threshold = int(expected_minutes * NO_POWER_ALERT_THRESHOLD_FRACTION)
+    return max(15, threshold)
+
+
+def read_report_state() -> dict:
+    """Read persisted report/alert state."""
+    if not REPORT_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(REPORT_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def write_report_state(state: dict) -> None:
+    """Persist report/alert state."""
+    REPORT_STATE_FILE.write_text(json.dumps(state))
+
+
+def was_alert_sent_for_date(target_date) -> bool:
+    """Return True if a no-power alert has already been sent for the date."""
+    state = read_report_state()
+    alerted_dates = state.get("alerted_dates", [])
+    return target_date.isoformat() in alerted_dates
+
+
+def mark_alert_sent_for_date(target_date) -> None:
+    """Mark a no-power alert as sent for the date."""
+    state = read_report_state()
+    alerted_dates = set(state.get("alerted_dates", []))
+    alerted_dates.add(target_date.isoformat())
+    state["alerted_dates"] = sorted(alerted_dates)
+    write_report_state(state)
+
+
+def choose_daily_report_dates(entries: list[tuple[datetime, str]]) -> tuple[Optional[datetime.date], Optional[datetime.date]]:
+    """Choose report date and comparison date from available log data."""
+    if not entries:
+        return None, None
+
+    available_dates = sorted({dt.date() for dt, _ in entries})
+    today = datetime.now().date()
+    report_date = available_dates[-1]
+
+    # Prefer the most recent completed day when today's data is still in progress.
+    if report_date == today and len(available_dates) >= 2:
+        report_date = available_dates[-2]
+
+    comparison_date = report_date - timedelta(days=1)
+    return report_date, comparison_date
+
+
+def format_minutes_as_hours(minutes: int) -> str:
+    """Format minutes as HH:MM HR."""
+    hours, mins = divmod(minutes, 60)
+    return f"{hours:02d}:{mins:02d} HR"
+
+
+def format_duration_hhmm(delta: timedelta) -> str:
+    """Format a timedelta as HH:MM."""
+    total_minutes = max(0, int(delta.total_seconds() // 60))
+    hours, mins = divmod(total_minutes, 60)
+    return f"{hours:02d}:{mins:02d}"
+
+
+def format_delta_sentence(label: str, delta_minutes: int) -> tuple[str, str]:
+    """Return plain-text and HTML versions of the daily delta sentence."""
+    if delta_minutes > 0:
+        direction = "more"
+        color = "#c62828"
+    elif delta_minutes < 0:
+        direction = "less"
+        color = "#2e7d32"
+    else:
+        direction = "the same as"
+        color = "#333333"
+
+    magnitude = abs(delta_minutes)
+    if direction == "the same as":
+        plain = f"There were {magnitude} minutes {direction} yesterday of {label.lower()} time."
+    else:
+        plain = f"There were {magnitude} minutes {direction} {label.lower()} time than yesterday."
+    html = f'<span style="color: {color}; font-weight: 600;">{plain}</span>'
+    return plain, html
+
+
+def build_daily_report_content(target_date=None) -> dict[str, str]:
+    """Build plain-text and HTML daily report content."""
+    entries = read_log()
+    if target_date is None:
+        report_date, comparison_date = choose_daily_report_dates(entries)
+    else:
+        report_date = target_date
+        comparison_date = report_date - timedelta(days=1)
+
+    if report_date is None:
+        plain = f"{SLACK_REPORT_NAME} daily report: no log entries found."
+        return {"plain": plain, "html": f"<p>{plain}</p>"}
+
+    report_minutes = get_daily_state_minutes(entries, report_date)
+    comparison_minutes = get_daily_state_minutes(entries, comparison_date) if comparison_date else {
+        STATE_ONLINE_OK: 0,
+        STATE_ONLINE_LOWPOWER: 0,
+        STATE_OFFLINE_NOPOWER: 0,
+        STATE_OFFLINE_SAVING: 0,
+    }
+    alert_sent = was_alert_sent_for_date(report_date)
+    expected_power_minutes = get_expected_power_on_minutes(report_date)
+    alert_threshold_minutes = get_no_power_alert_threshold_minutes(report_date)
+
+    low_power_plain, low_power_html = format_delta_sentence(
+        "Low Power",
+        report_minutes[STATE_ONLINE_LOWPOWER] - comparison_minutes[STATE_ONLINE_LOWPOWER],
+    )
+    no_power_plain, no_power_html = format_delta_sentence(
+        "No Power",
+        report_minutes[STATE_OFFLINE_NOPOWER] - comparison_minutes[STATE_OFFLINE_NOPOWER],
+    )
+    last_no_power_dt = None
+    for dt, state in reversed(entries):
+        if state == STATE_OFFLINE_NOPOWER:
+            last_no_power_dt = dt
+            break
+
+    if last_no_power_dt is None:
+        no_power_since_plain = "It has been N/A since the last no power event."
+    else:
+        no_power_since_plain = (
+            f"It has been {format_duration_hhmm(datetime.now() - last_no_power_dt)} "
+            "since the last no power event."
+        )
+
+    alert_plain = ""
+    alert_html = ""
+    if alert_sent:
+        alert_plain = (
+            "ALERT: Power failure threshold exceeded for this day. "
+            f"Daily accumulated no power time: {format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])} "
+            f"(threshold: {format_minutes_as_hours(alert_threshold_minutes)} of "
+            f"{format_minutes_as_hours(expected_power_minutes)} expected on-time).\n\n"
+        )
+        alert_html = (
+            f'<p style="margin: 0 0 16px 0; color: #c62828; font-weight: 700;">'
+            f'ALERT: Power failure threshold exceeded for this day. '
+            f'Daily accumulated no power time: {format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])} '
+            f'(threshold: {format_minutes_as_hours(alert_threshold_minutes)} of '
+            f'{format_minutes_as_hours(expected_power_minutes)} expected on-time).'
+            f'</p>'
+        )
+
+    plain = (
+        f"{alert_plain}{SLACK_REPORT_NAME} daily report for {report_date:%Y-%m-%d}\n\n"
+        f"OK\t-\t{format_minutes_as_hours(report_minutes[STATE_ONLINE_OK])}\n"
+        f"Power Saver\t-\t{format_minutes_as_hours(report_minutes[STATE_OFFLINE_SAVING])}\n"
+        f"Low Power\t-\t{format_minutes_as_hours(report_minutes[STATE_ONLINE_LOWPOWER])}\n"
+        f"No Power\t-\t{format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])}\n\n"
+        f"{low_power_plain}\n"
+        f"{no_power_plain}\n"
+        f"{no_power_since_plain}"
+    )
+
+    html = f"""
+<html>
+  <body style="font-family: Arial, sans-serif; color: #222;">
+    {alert_html}
+    <h2 style="margin-bottom: 8px;">{SLACK_REPORT_NAME} daily report for {report_date:%Y-%m-%d}</h2>
+    <table style="border-collapse: collapse; margin-bottom: 16px;">
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">OK</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_ONLINE_OK])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Power Saver</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_OFFLINE_SAVING])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Low Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_ONLINE_LOWPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])}</td></tr>
+    </table>
+    <p style="margin: 0 0 8px 0;">{low_power_html}</p>
+    <p style="margin: 0 0 16px 0;">{no_power_html}</p>
+    <p style="margin: 0 0 16px 0;">{no_power_since_plain}</p>
+    <img src="cid:webcam_chart_inline" alt="Webcam status chart" style="max-width: 100%; height: auto; border: 1px solid #ddd;" />
+  </body>
+</html>
+""".strip()
+
+    return {"plain": plain, "html": html}
+
+
+def slack_api_post(method: str, payload: dict, *, use_json: bool = True) -> dict:
+    """Call the Slack Web API and return the JSON response."""
+    if not SLACK_BOT_TOKEN:
+        raise RuntimeError("SLACK_BOT_TOKEN is not set")
+
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    if use_json:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+        resp = requests.post(
+            f"https://slack.com/api/{method}",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=30,
+        )
+    else:
+        resp = requests.post(
+            f"https://slack.com/api/{method}",
+            headers=headers,
+            data=payload,
+            timeout=30,
+        )
+    resp.raise_for_status()
+    body = resp.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Slack API {method} failed: {body.get('error', 'unknown_error')}")
+    return body
+
+
+def slack_upload_file(path: Path, title: str) -> None:
+    """Upload one file to Slack using the current external upload flow."""
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot upload missing file: {path}")
+    if not SLACK_CHANNEL_ID:
+        raise RuntimeError("SLACK_CHANNEL_ID is not set")
+
+    upload_info = slack_api_post(
+        "files.getUploadURLExternal",
+        {"filename": path.name, "length": path.stat().st_size},
+        use_json=False,
+    )
+
+    with open(path, "rb") as f:
+        upload_resp = requests.post(
+            upload_info["upload_url"],
+            files={"file": (path.name, f)},
+            timeout=60,
+        )
+    upload_resp.raise_for_status()
+
+    slack_api_post(
+        "files.completeUploadExternal",
+        {
+            "channel_id": SLACK_CHANNEL_ID,
+            "files": [{"id": upload_info["file_id"], "title": title}],
+        },
+    )
+
+
+def send_daily_report(days: int = 1) -> None:
+    """Generate the chart and send a summary, chart, and log to Slack."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        raise RuntimeError("Set SLACK_BOT_TOKEN and SLACK_CHANNEL_ID before sending Slack reports")
+
+    generate_chart(days=DEFAULT_CHART_DAYS)
+    report_content = build_daily_report_content()
+    slack_api_post(
+        "chat.postMessage",
+        {
+            "channel": SLACK_CHANNEL_ID,
+            "text": report_content["plain"],
+        },
+    )
+    slack_upload_file(CHART_FILE, f"{SLACK_REPORT_NAME} chart")
+    slack_upload_file(LOG_FILE, f"{SLACK_REPORT_NAME} log")
+
+
+def send_email_with_attachments(subject: str, plain_body: str, html_body: str, attachments: list[Path]) -> None:
+    """Send an email with attachments via SMTP."""
+    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not EMAIL_FROM or not EMAIL_TO:
+        raise RuntimeError(
+            "Set SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, and EMAIL_TO before sending email reports"
+        )
+    recipients = [addr.strip() for addr in EMAIL_TO.split(",") if addr.strip()]
+    if not recipients:
+        raise RuntimeError("EMAIL_TO must contain at least one recipient email address")
+    log.info("Sending email report to %s", ", ".join(recipients))
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(plain_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    chart_bytes = None
+    if CHART_FILE.exists():
+        chart_bytes = CHART_FILE.read_bytes()
+        msg.get_payload()[-1].add_related(
+            chart_bytes,
+            maintype="image",
+            subtype="png",
+            cid="<webcam_chart_inline>",
+        )
+
+    for path in attachments:
+        if not path.exists():
+            log.warning("Skipping missing attachment: %s", path)
+            continue
+        mime_type, _ = mimetypes.guess_type(path.name)
+        if mime_type:
+            maintype, subtype = mime_type.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        with open(path, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as server:
+        server.ehlo()
+        if SMTP_USE_TLS:
+            server.starttls()
+            server.ehlo()
+        server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg, to_addrs=recipients)
+    log.info("Email report sent successfully")
+
+
+def send_daily_email_report(days: int = 1, report_date=None) -> None:
+    """Generate the chart and email a summary, chart, and logs."""
+    generate_chart(days=DEFAULT_CHART_DAYS)
+    report_content = build_daily_report_content(target_date=report_date)
+    subject_date = report_date if report_date is not None else datetime.now().date()
+    subject = f"{SLACK_REPORT_NAME} daily report - {subject_date.strftime('%Y-%m-%d')}"
+    send_email_with_attachments(
+        subject,
+        report_content["plain"],
+        report_content["html"],
+        [CHART_FILE, LOG_FILE, DIAGNOSTICS_FILE],
+    )
+
+
+def build_alert_content(target_date, no_power_minutes: int, expected_power_minutes: int) -> dict[str, str]:
+    """Build plain-text and HTML content for a no-power alert."""
+    threshold_minutes = get_no_power_alert_threshold_minutes(target_date)
+    plain = (
+        f"ALERT: Power failure threshold exceeded for {target_date:%Y-%m-%d}.\n\n"
+        f"Daily accumulated no power time: {format_minutes_as_hours(no_power_minutes)}\n"
+        f"Expected power-on time: {format_minutes_as_hours(expected_power_minutes)}\n"
+        f"Alert threshold: {format_minutes_as_hours(threshold_minutes)}\n"
+    )
+    html = f"""
+<html>
+  <body style="font-family: Arial, sans-serif; color: #222;">
+    <p style="margin: 0 0 16px 0; color: #c62828; font-weight: 700;">
+      ALERT: Power failure threshold exceeded for {target_date:%Y-%m-%d}.
+    </p>
+    <p style="margin: 0 0 8px 0;">Daily accumulated no power time: <strong>{format_minutes_as_hours(no_power_minutes)}</strong></p>
+    <p style="margin: 0 0 8px 0;">Expected power-on time: <strong>{format_minutes_as_hours(expected_power_minutes)}</strong></p>
+    <p style="margin: 0 0 16px 0;">Alert threshold: <strong>{format_minutes_as_hours(threshold_minutes)}</strong></p>
+  </body>
+</html>
+""".strip()
+    return {"plain": plain, "html": html}
+
+
+def send_no_power_alert(target_date, no_power_minutes: int, expected_power_minutes: int) -> None:
+    """Send the one-per-day no-power alert through email and webhook."""
+    alert_content = build_alert_content(target_date, no_power_minutes, expected_power_minutes)
+
+    if SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and EMAIL_FROM and EMAIL_TO:
+        subject = f"ALERT: {SLACK_REPORT_NAME} power failure - {target_date:%Y-%m-%d}"
+        send_email_with_attachments(subject, alert_content["plain"], alert_content["html"], [])
+
+    if LAMBDA_WEBHOOK_URL:
+        payload = {
+            "source": SLACK_REPORT_NAME,
+            "event": "power_failure_alert",
+            "report_date": target_date.isoformat(),
+            "text": f"@here\n{alert_content['plain']}",
+            "html": (
+                f"<p style=\"color: #c62828; font-weight: 700;\">@here</p>"
+                f"{alert_content['html']}"
+            ),
+        }
+        post_lambda_webhook(payload)
+
+
+def build_chart_base64() -> Optional[str]:
+    """Return the chart PNG as a base64 string, if available."""
+    if not CHART_FILE.exists():
+        return None
+    return base64.b64encode(CHART_FILE.read_bytes()).decode("ascii")
+
+
+def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
+    """Return an ASCII version of the chart based on logged states.
+
+    Symbols:
+      O = Online - OK
+      L = Online - Low Power
+      X = Offline - No Power
+      P = Offline - PowerSaving
+      space = no data
+
+    The chart keeps all 4 quarter-hour samples per hour. It is intended to
+    be wrapped in a code block / preformatted block by the caller.
+    """
+    entries = read_log()
+    if not entries:
+        return None
+
+    now = datetime.now()
+    end_date = now.date()
+    start_date = end_date - timedelta(days=days - 1)
+
+    from collections import defaultdict
+
+    grid: dict[str, dict[int, str]] = defaultdict(dict)
+    for dt, state in entries:
+        if dt.date() < start_date or dt.date() > end_date:
+            continue
+        date_key = dt.strftime("%Y-%m-%d")
+        slot = (dt.hour * 60 + dt.minute) // 15
+        grid[date_key][slot] = state
+
+    symbol_map = {
+        STATE_ONLINE_OK: "O",
+        STATE_ONLINE_LOWPOWER: "L",
+        STATE_OFFLINE_NOPOWER: "X",
+        STATE_OFFLINE_SAVING: "P",
+    }
+
+    axis_blocks = []
+    for hour in range(24):
+        label = f"{hour % 12 or 12}{'A' if hour < 12 else 'P'}"
+        axis_blocks.append(f"{label:<4}")
+    axis_line = "".join(axis_blocks).rstrip()
+
+    lines = ["Each character is one 15-minute period."]
+
+    d = start_date
+    while d <= end_date:
+        date_key = d.strftime("%Y-%m-%d")
+        row = "".join(symbol_map.get(grid.get(date_key, {}).get(slot_idx), " ") for slot_idx in range(96)).rstrip()
+        lines.append(f"{d:%m/%d/%Y} {row}".rstrip())
+        d += timedelta(days=1)
+
+    lines.append(" " * 11 + axis_line)
+    lines.append(" " * 11 + "Legend:      O=OK            X=NoPower            P=PowerSaver            L=LowPower")
+
+    return "\n".join(lines)
+
+
+def post_lambda_webhook(payload: dict) -> None:
+    """POST a JSON payload to the Lambda webhook."""
+    if not LAMBDA_WEBHOOK_URL:
+        raise RuntimeError("LAMBDA_WEBHOOK_URL is not set")
+    payload_json = json.dumps(payload)
+    payload_size = len(payload_json.encode("utf-8"))
+    log.info("Posting webhook payload to %s (%d bytes)", LAMBDA_WEBHOOK_URL, payload_size)
+    resp = requests.post(
+        LAMBDA_WEBHOOK_URL,
+        data=payload_json,
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    if not resp.ok:
+        response_preview = resp.text[:1000].replace("\n", "\\n")
+        log.error(
+            "Webhook POST failed with status %s. Response preview: %s",
+            resp.status_code,
+            response_preview or "<empty>",
+        )
+        resp.raise_for_status()
+    log.info("Webhook POST completed with status %s", resp.status_code)
+
+
+def send_daily_webhook_report(report_date=None) -> None:
+    """Send the nightly report body to the lab data webhook."""
+    report_content = build_daily_report_content(target_date=report_date)
+    chart_ascii = build_chart_ascii()
+    text_body = report_content["plain"]
+    html_body = report_content["html"]
+
+    if chart_ascii:
+        text_body = f"{text_body}\n\nASCII chart\n```\n{chart_ascii}\n```"
+        html_body = html_body.replace(
+            "</body>",
+            f'<h3 style="margin: 16px 0 8px 0;">ASCII chart</h3>'
+            f'<pre style="font-family: Courier New, monospace; font-size: 10px; line-height: 1.1; '
+            f'background: #f7f7f7; border: 1px solid #ddd; padding: 8px; white-space: pre-wrap;">'
+            f'{html.escape(chart_ascii)}</pre></body>',
+        )
+
+    payload = {
+        "source": SLACK_REPORT_NAME,
+        "event": "daily_report",
+        "report_date": (report_date or datetime.now().date()).isoformat(),
+        "text": text_body,
+        "html": html_body,
+        "chart_image_base64_png": build_chart_base64(),
+        "chart_ascii_art": build_chart_ascii(),
+    }
+    post_lambda_webhook(payload)
+
+
+def send_lambdatest() -> None:
+    """Send the nightly Lambda webhook report payload on demand."""
+    send_daily_webhook_report()
+
+
+def maybe_send_no_power_alert(now: datetime) -> None:
+    """Send a one-per-day alert when no-power time exceeds the threshold."""
+    target_date = now.date()
+    if was_alert_sent_for_date(target_date):
+        return
+
+    entries = read_log()
+    daily_minutes = get_daily_state_minutes(entries, target_date)
+    no_power_minutes = daily_minutes[STATE_OFFLINE_NOPOWER]
+    expected_power_minutes = get_expected_power_on_minutes(target_date)
+    threshold_minutes = get_no_power_alert_threshold_minutes(target_date)
+
+    if expected_power_minutes <= 0:
+        return
+    if no_power_minutes < threshold_minutes:
+        return
+
+    send_no_power_alert(target_date, no_power_minutes, expected_power_minutes)
+    mark_alert_sent_for_date(target_date)
+
+
+def send_alerttest() -> None:
+    """Send a simulated no-power alert for testing."""
+    target_date = datetime.now().date()
+    expected_power_minutes = get_expected_power_on_minutes(target_date)
+    threshold_minutes = get_no_power_alert_threshold_minutes(target_date)
+    simulated_no_power_minutes = max(threshold_minutes, int(expected_power_minutes * 0.5))
+    send_no_power_alert(target_date, simulated_no_power_minutes, expected_power_minutes)
+
+
+def get_next_scheduled_check(after: Optional[datetime] = None) -> datetime:
+    """Return the next check time aligned near the end of a 15-minute block."""
+    if after is None:
+        after = datetime.now()
+
+    base = after.replace(second=0, microsecond=0)
+    minutes_to_add = CHECK_INTERVAL_SECONDS // 60 - (base.minute % (CHECK_INTERVAL_SECONDS // 60)) - 1
+    if minutes_to_add < 0:
+        minutes_to_add += CHECK_INTERVAL_SECONDS // 60
+    scheduled = base + timedelta(minutes=minutes_to_add)
+    scheduled = scheduled.replace(second=CHECK_TARGET_SECOND)
+
+    if scheduled <= after:
+        scheduled += timedelta(minutes=CHECK_INTERVAL_SECONDS // 60)
+        scheduled = scheduled.replace(second=CHECK_TARGET_SECOND)
+    return scheduled
+
+
+def read_last_reported_date() -> Optional[str]:
+    """Read the last date for which a daily email report was sent."""
+    if not REPORT_STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(REPORT_STATE_FILE.read_text())
+        return data.get("last_report_date")
+    except Exception:
+        return None
+
+
+def write_last_reported_date(report_date: str) -> None:
+    """Persist the last date for which a daily email report was sent."""
+    REPORT_STATE_FILE.write_text(json.dumps({"last_report_date": report_date}))
+
+
+def maybe_send_end_of_day_report(now: datetime) -> None:
+    # Trigger after the final aligned late-night sample (23:44:50, 23:59:50, etc.)
+    if now.hour != 23 or now.minute < 45:
+        return
+
+    report_date = now.date().isoformat()
+    if read_last_reported_date() == report_date:
+        return
+
+    if SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and EMAIL_FROM and EMAIL_TO:
+        send_daily_email_report(report_date=now.date())
+    if LAMBDA_WEBHOOK_URL:
+        send_daily_webhook_report(report_date=now.date())
+    write_last_reported_date(report_date)
+
+# ─── Chart generation ────────────────────────────────────────────────────────
+
+def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
+    """Generate a horizontal timeline chart from the log file.
+
+    Each row is one calendar day. Each 15-minute slot is colored by state.
+    """
+    entries = read_log()
+    if not entries:
+        log.warning("No log entries — cannot generate chart.")
+        return
+
+    now = datetime.now()
+    # Determine date range
+    end_date = now.date()
+    start_date = end_date - timedelta(days=days - 1)
+
+    # Bucket entries by date and 15-min slot
+    # slot index: 0 = 00:00, 1 = 00:15, ..., 95 = 23:45
+    from collections import defaultdict
+    grid: dict[str, dict[int, str]] = defaultdict(dict)
+
+    for dt, state in entries:
+        if dt.date() < start_date or dt.date() > end_date:
+            continue
+        date_key = dt.strftime("%Y-%m-%d")
+        slot = (dt.hour * 60 + dt.minute) // 15
+        grid[date_key][slot] = state
+
+    # Build the list of dates to display
+    dates = []
+    d = start_date
+    while d <= end_date:
+        dates.append(d)
+        d += timedelta(days=1)
+
+    if not dates:
+        log.warning("No dates in range — cannot generate chart.")
+        return
+
+    # ── Plot ──────────────────────────────────────────────────────────────
+    n_days = len(dates)
+    fig_height = max(3, 0.55 * n_days + 1.4)
+    fig, ax = plt.subplots(figsize=(16, fig_height))
+
+    band_height = 2 / 3
+    divider_linewidth = 0.8
+    endcap_radius_minutes = 7.5
+
+    for row_idx, date in enumerate(reversed(dates)):
+        date_key = date.strftime("%Y-%m-%d")
+        slots = grid.get(date_key, {})
+        if slots:
+            day_start = min(slots)
+            day_end = max(slots) + 1
+
+            for slot_idx in range(day_start, day_end):
+                state = slots.get(slot_idx)
+                if state is None:
+                    continue
+                color = STATE_COLORS.get(state, "#cccccc")
+                slot_patch = mpatches.Rectangle(
+                    (slot_idx * 15, row_idx - (band_height / 2)),
+                    15,
+                    band_height,
+                    linewidth=0,
+                    facecolor=color,
+                    edgecolor="none",
+                    zorder=2,
+                )
+                ax.add_patch(slot_patch)
+
+            first_state = slots.get(day_start)
+            last_state = slots.get(day_end - 1)
+            if first_state is not None:
+                ax.add_patch(
+                    mpatches.Ellipse(
+                        (day_start * 15, row_idx),
+                        width=2 * endcap_radius_minutes,
+                        height=band_height,
+                        facecolor=STATE_COLORS.get(first_state, "#cccccc"),
+                        edgecolor="none",
+                        zorder=2,
+                    )
+                )
+            if last_state is not None:
+                ax.add_patch(
+                    mpatches.Ellipse(
+                        (day_end * 15, row_idx),
+                        width=2 * endcap_radius_minutes,
+                        height=band_height,
+                        facecolor=STATE_COLORS.get(last_state, "#cccccc"),
+                        edgecolor="none",
+                        zorder=2,
+                    )
+                )
+
+        divider_ymin = row_idx - (band_height / 2)
+        divider_ymax = row_idx + (band_height / 2)
+        for boundary_slot in range(1, 96):
+            if slots.get(boundary_slot - 1) is None or slots.get(boundary_slot) is None:
+                continue
+            x_boundary = boundary_slot * 15
+            divider, = ax.plot(
+                [x_boundary, x_boundary],
+                [divider_ymin, divider_ymax],
+                color="black",
+                linewidth=divider_linewidth,
+                solid_capstyle="butt",
+                zorder=3,
+            )
+
+    # Y-axis: date labels
+    y_labels = [d.strftime("%-m/%-d/%Y") for d in reversed(dates)]
+    ax.set_yticks(range(n_days))
+    ax.set_yticklabels(y_labels, fontsize=9)
+    ax.set_ylim(-0.5, n_days - 0.5)
+
+    # X-axis: hours
+    hour_ticks = list(range(0, 25 * 60, 60))
+    hour_labels = [
+        f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}" if h <= 24 else ""
+        for h in range(25)
+    ]
+    ax.set_xticks(hour_ticks)
+    ax.set_xticklabels(hour_labels, fontsize=7.5, rotation=0)
+    ax.set_xlim(0, 24 * 60)
+
+    # Grid and styling
+    ax.set_axisbelow(True)
+    ax.grid(axis="x", color="#e0e0e0", linewidth=0.5)
+    ax.tick_params(axis="both", which="both", length=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+
+    # Legend
+    legend_patches = [
+        mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_OK],       label="Online - OK"),
+        mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_LOWPOWER], label="Online - Low Power"),
+        mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_NOPOWER], label="Offline - No Power"),
+        mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_SAVING],  label="Offline - PowerSaving"),
+    ]
+    ax.legend(
+        handles=legend_patches,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.15 - (0.04 * max(0, 7 - n_days))),
+        ncol=4,
+        fontsize=9,
+        frameon=False,
+    )
+
+    ax.set_title(
+        "UMCI - Construction CAM Status",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+    )
+
+    fig.tight_layout()
+    fig.savefig(CHART_FILE, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    log.info("Chart saved to %s", CHART_FILE)
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def run_once(now: Optional[datetime] = None) -> str:
+    """Perform a single check, log it, regenerate the chart, and return state."""
+    if now is None:
+        now = datetime.now()
+    state, diagnostics = determine_state(now)
+    append_log(now, state)
+    append_diagnostics_log(now, state, diagnostics)
+    log.info("State: %s", state)
+    generate_chart(days=DEFAULT_CHART_DAYS)
+    maybe_send_no_power_alert(now)
+    maybe_send_end_of_day_report(now)
+    return state
+
+
+def run_loop() -> None:
+    """Run checks continuously on a 15-minute aligned schedule."""
+    log.info("Starting continuous monitoring with an immediate startup check")
+    try:
+        run_once()
+    except Exception:
+        log.exception("Error during startup check")
+
+    while True:
+        next_check = get_next_scheduled_check()
+        sleep_seconds = max(0.0, (next_check - datetime.now()).total_seconds())
+        log.info("Next aligned check at %s", next_check.strftime("%Y-%m-%d %H:%M:%S"))
+        time.sleep(sleep_seconds)
+        try:
+            run_once(now=next_check)
+        except Exception:
+            log.exception("Error during check")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Monitor the U-M Center for Innovation webcam."
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run continuously every 15 minutes.",
+    )
+    parser.add_argument(
+        "--chart",
+        nargs="?",
+        const=DEFAULT_CHART_DAYS,
+        type=int,
+        metavar="DAYS",
+        help=f"Regenerate chart from existing log (default: {DEFAULT_CHART_DAYS} days).",
+    )
+    parser.add_argument(
+        "--daily-report",
+        nargs="?",
+        const=1,
+        type=int,
+        metavar="DAYS",
+        help="Send a Slack daily report with chart and log (default summary window: 1 day).",
+    )
+    parser.add_argument(
+        "--daily-email-report",
+        nargs="?",
+        const=1,
+        type=int,
+        metavar="DAYS",
+        help="Send an email daily report with chart and logs (default summary window: 1 day).",
+    )
+    parser.add_argument(
+        "--lambdatest",
+        action="store_true",
+        help="Send the nightly Lambda webhook report payload now.",
+    )
+    parser.add_argument(
+        "--alerttest",
+        action="store_true",
+        help="Send a no-power alert test message now.",
+    )
+    args = parser.parse_args()
+
+    if args.chart is not None:
+        generate_chart(days=args.chart)
+    elif args.daily_report is not None:
+        send_daily_report(days=args.daily_report)
+    elif args.daily_email_report is not None:
+        send_daily_email_report(days=args.daily_email_report)
+    elif args.lambdatest:
+        send_lambdatest()
+    elif args.alerttest:
+        send_alerttest()
+    elif args.loop:
+        run_loop()
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()

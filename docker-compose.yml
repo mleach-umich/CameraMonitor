@@ -1,0 +1,39 @@
+services:
+  webcam-monitor:
+    build: .
+    container_name: webcam-monitor
+    restart: unless-stopped
+    volumes:
+      # Log and chart files persist here on the host
+      - ./data:/data
+    environment:
+      - TZ=America/Detroit
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID:-}
+      - SLACK_REPORT_NAME=${SLACK_REPORT_NAME:-UMCI Camera Monitor}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - EMAIL_FROM=${EMAIL_FROM:-}
+      - EMAIL_TO=${EMAIL_TO:-}
+      - SMTP_USE_TLS=${SMTP_USE_TLS:-true}
+      - LAMBDA_WEBHOOK_URL=${LAMBDA_WEBHOOK_URL:-https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook}
+
+  webcam-monitor-files:
+    image: caddy:2-alpine
+    container_name: webcam-monitor-files
+    restart: unless-stopped
+    depends_on:
+      - webcam-monitor
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./data:/srv:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
