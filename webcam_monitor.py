@@ -2,7 +2,7 @@
 """
 Webcam Monitor — U-M Center for Innovation Construction Camera
 ==============================================================
-Monitors an HLS live stream every 15 minutes, classifies the camera state,
+Monitors an HLS live stream on a configurable schedule, classifies the camera state,
 logs results, and generates a timeline chart.
 
 States
@@ -19,7 +19,7 @@ Daylight is defined relative to the camera location (Ann Arbor, MI):
 Usage
 -----
   python webcam_monitor.py              # Run one check now
-  python webcam_monitor.py --loop       # Run continuously every 15 minutes
+  python webcam_monitor.py --loop       # Run continuously on configured schedule
   python webcam_monitor.py --chart      # Regenerate the chart from the log
   python webcam_monitor.py --chart 14   # Chart for the last 14 days
   python webcam_monitor.py --daily-report     # Send chart + log to Slack
@@ -47,7 +47,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Optional
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import matplotlib
 matplotlib.use("Agg")
@@ -70,37 +70,215 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install requests")
 
-# ─── Configuration ────────────────────────────────────────────────────────────
 
-STREAM_URL = (
+CONFIG_VALIDATION_WARNINGS: list[str] = []
+
+
+def add_config_warning(message: str) -> None:
+    CONFIG_VALIDATION_WARNINGS.append(message)
+
+
+def get_env_int(
+    name: str,
+    default: int,
+    *,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+    allowed: Optional[set[int]] = None,
+) -> int:
+    """Read an integer from env, validating and falling back to default when needed."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        add_config_warning(f"{name}={raw!r} is not an integer; using default {default}.")
+        return default
+    if min_value is not None and value < min_value:
+        add_config_warning(f"{name}={value} is below minimum {min_value}; using default {default}.")
+        return default
+    if max_value is not None and value > max_value:
+        add_config_warning(f"{name}={value} is above maximum {max_value}; using default {default}.")
+        return default
+    if allowed is not None and value not in allowed:
+        allowed_values = ", ".join(str(v) for v in sorted(allowed))
+        add_config_warning(f"{name}={value} is not one of [{allowed_values}]; using default {default}.")
+        return default
+    return value
+
+
+def get_env_float(
+    name: str,
+    default: float,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    """Read a float from env, validating and falling back to default when needed."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        add_config_warning(f"{name}={raw!r} is not a number; using default {default}.")
+        return default
+    if min_value is not None and value < min_value:
+        add_config_warning(f"{name}={value} is below minimum {min_value}; using default {default}.")
+        return default
+    if max_value is not None and value > max_value:
+        add_config_warning(f"{name}={value} is above maximum {max_value}; using default {default}.")
+        return default
+    return value
+
+
+def get_env_choice(name: str, default: str, allowed: set[str]) -> str:
+    """Read a case-insensitive env choice."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    normalized = raw.lower()
+    if normalized not in allowed:
+        allowed_values = ", ".join(sorted(allowed))
+        add_config_warning(f"{name}={raw!r} is invalid; allowed values: {allowed_values}. Using default {default}.")
+        return default
+    return normalized
+
+
+def get_env_timezone(name: str, default: str) -> str:
+    """Read and validate an IANA time zone name."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        ZoneInfo(raw)
+    except ZoneInfoNotFoundError:
+        add_config_warning(f"{name}={raw!r} is not a valid IANA time zone; using default {default}.")
+        return default
+    return raw
+
+
+def parse_fixed_times_env(name: str, max_times: int = 4) -> list[int]:
+    """Parse comma-separated HH:MM times from env into minute-of-day values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+
+    parsed_minutes: list[int] = []
+    seen: set[int] = set()
+    for token in [piece.strip() for piece in raw.split(",") if piece.strip()]:
+        try:
+            t = datetime.strptime(token, "%H:%M")
+        except ValueError:
+            add_config_warning(f"{name} contains invalid time {token!r}; expected HH:MM (24-hour).")
+            continue
+        minute_of_day = t.hour * 60 + t.minute
+        if minute_of_day in seen:
+            add_config_warning(f"{name} contains duplicate time {token!r}; duplicates are ignored.")
+            continue
+        parsed_minutes.append(minute_of_day)
+        seen.add(minute_of_day)
+
+    parsed_minutes.sort()
+    if len(parsed_minutes) > max_times:
+        add_config_warning(
+            f"{name} provided {len(parsed_minutes)} times; only the first {max_times} earliest times are used."
+        )
+        parsed_minutes = parsed_minutes[:max_times]
+    return parsed_minutes
+
+
+def minute_to_hhmm(minute_of_day: int) -> str:
+    """Format a minute-of-day value as HH:MM."""
+    h, m = divmod(minute_of_day, 60)
+    return f"{h:02d}:{m:02d}"
+
+
+def compute_schedule_slot_starts(mode: str, cadence_minutes: int, fixed_times_minutes: list[int]) -> list[int]:
+    """Return slot starts (minutes since midnight) for one day."""
+    if mode == "fixed":
+        return fixed_times_minutes
+    return list(range(0, 24 * 60, cadence_minutes))
+
+
+def compute_schedule_check_minutes(mode: str, cadence_minutes: int, fixed_times_minutes: list[int]) -> list[int]:
+    """Return check execution times (minutes since midnight) for one day."""
+    if mode == "fixed":
+        return fixed_times_minutes
+    return list(range(cadence_minutes - 1, 24 * 60, cadence_minutes))
+
+
+# Configuration
+
+DEFAULT_STREAM_URL = (
     "https://558312d54930d.streamlock.net"
     "/live/umci.fois.axis.stream/playlist.m3u8"
 )
+STREAM_URL = os.environ.get("STREAM_URL", DEFAULT_STREAM_URL).strip()
+if not STREAM_URL:
+    add_config_warning(f"STREAM_URL is empty; using default {DEFAULT_STREAM_URL}.")
+    STREAM_URL = DEFAULT_STREAM_URL
+elif not (STREAM_URL.startswith("http://") or STREAM_URL.startswith("https://")):
+    add_config_warning(f"STREAM_URL={STREAM_URL!r} should start with http:// or https://.")
 
-# Camera location — Ann Arbor, MI
-LATITUDE  = 42.325
-LONGITUDE = -83.05
-TIMEZONE  = "America/New_York"  # preferred IANA name for compatibility
+# Camera location - Ann Arbor, MI
+LATITUDE = get_env_float("CAMERA_LATITUDE", 42.325, min_value=-90.0, max_value=90.0)
+LONGITUDE = get_env_float("CAMERA_LONGITUDE", -83.05, min_value=-180.0, max_value=180.0)
+TIMEZONE = get_env_timezone("CAMERA_TIMEZONE", "America/New_York")
 
-# Paths — use MONITOR_DATA_DIR env var if set (e.g. inside Docker),
+# Paths - use MONITOR_DATA_DIR env var if set (e.g. inside Docker),
 # otherwise default to the same directory as this script.
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR   = Path(os.environ.get("MONITOR_DATA_DIR", str(SCRIPT_DIR)))
-LOG_FILE   = DATA_DIR / "webcam_log.csv"
+DATA_DIR = Path(os.environ.get("MONITOR_DATA_DIR", str(SCRIPT_DIR)))
+LOG_FILE = DATA_DIR / "webcam_log.csv"
 CHART_FILE = DATA_DIR / "webcam_chart.png"
 DIAGNOSTICS_FILE = DATA_DIR / "webcam_stream_diagnostics.csv"
 REPORT_STATE_FILE = DATA_DIR / "daily_report_state.json"
 
-CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
-CHECK_TARGET_SECOND = 50
+ALLOWED_CADENCE_MINUTES = {15, 30, 60, 120, 240, 480}
+MEASUREMENT_SCHEDULE_MODE = get_env_choice("MEASUREMENT_SCHEDULE_MODE", "cadence", {"cadence", "fixed"})
+MEASUREMENT_CADENCE_MINUTES = get_env_int(
+    "MEASUREMENT_CADENCE_MINUTES",
+    15,
+    allowed=ALLOWED_CADENCE_MINUTES,
+)
+MEASUREMENT_FIXED_TIMES = parse_fixed_times_env("MEASUREMENT_FIXED_TIMES", max_times=4)
+
+if MEASUREMENT_SCHEDULE_MODE == "fixed" and not MEASUREMENT_FIXED_TIMES:
+    add_config_warning(
+        "MEASUREMENT_SCHEDULE_MODE=fixed requires at least one valid HH:MM time in MEASUREMENT_FIXED_TIMES; "
+        "falling back to cadence mode."
+    )
+    MEASUREMENT_SCHEDULE_MODE = "cadence"
+
+SCHEDULE_SLOT_STARTS = compute_schedule_slot_starts(
+    MEASUREMENT_SCHEDULE_MODE,
+    MEASUREMENT_CADENCE_MINUTES,
+    MEASUREMENT_FIXED_TIMES,
+)
+SCHEDULE_CHECK_MINUTES = compute_schedule_check_minutes(
+    MEASUREMENT_SCHEDULE_MODE,
+    MEASUREMENT_CADENCE_MINUTES,
+    MEASUREMENT_FIXED_TIMES,
+)
+if not SCHEDULE_SLOT_STARTS or not SCHEDULE_CHECK_MINUTES:
+    raise RuntimeError("Schedule configuration produced no slots/check times.")
+
+CHECK_TARGET_SECOND = get_env_int("CHECK_TARGET_SECOND", 50, min_value=0, max_value=59)
 DEFAULT_CHART_DAYS = 14
-CAMERA_TRANSITION_GRACE_MINUTES = 15
-NO_POWER_ALERT_THRESHOLD_FRACTION = 0.33
+CAMERA_TRANSITION_GRACE_MINUTES = get_env_int("CAMERA_TRANSITION_GRACE_MINUTES", 15, min_value=0)
+NO_POWER_ALERT_THRESHOLD_FRACTION = get_env_float(
+    "NO_POWER_ALERT_THRESHOLD_FRACTION",
+    0.33,
+    min_value=0.0,
+    max_value=1.0,
+)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 SLACK_REPORT_NAME = os.environ.get("SLACK_REPORT_NAME", "UMCI Camera Monitor").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_PORT = get_env_int("SMTP_PORT", 587, min_value=1, max_value=65535)
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USERNAME).strip()
@@ -112,14 +290,17 @@ LAMBDA_WEBHOOK_URL = os.environ.get(
 ).strip()
 
 # How many seconds ffmpeg is allowed to attempt frame capture
-FFMPEG_TIMEOUT = 20
+FFMPEG_TIMEOUT = get_env_int("FFMPEG_TIMEOUT_SECONDS", 20, min_value=1)
+STREAM_CHECK_TIMEOUT_SECONDS = get_env_int("STREAM_CHECK_TIMEOUT_SECONDS", 10, min_value=1)
+STREAM_CHECK_RETRIES = get_env_int("STREAM_CHECK_RETRIES", 2, min_value=0)
+STREAM_CHECK_RETRY_DELAY_SECONDS = get_env_float("STREAM_CHECK_RETRY_DELAY_SECONDS", 2.0, min_value=0.0)
 
 # Detection thresholds for "low power" red text
 # We look at the top-left overlay region of the captured frame
-RED_HUE_RANGE   = (340, 20)   # Hue wraps around 0/360
-RED_SAT_MIN     = 80          # Minimum saturation (0-255)
-RED_VAL_MIN     = 80          # Minimum value/brightness (0-255)
-RED_PIXEL_RATIO = 0.005       # >0.5% red pixels in overlay region → low power
+RED_HUE_RANGE = (340, 20)   # Hue wraps around 0/360
+RED_SAT_MIN = 80            # Minimum saturation (0-255)
+RED_VAL_MIN = 80            # Minimum value/brightness (0-255)
+RED_PIXEL_RATIO = get_env_float("RED_PIXEL_RATIO", 0.005, min_value=0.0, max_value=1.0)
 
 # ─── State constants ──────────────────────────────────────────────────────────
 
@@ -143,6 +324,51 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("webcam_monitor")
+
+for warning in CONFIG_VALIDATION_WARNINGS:
+    log.warning("Config: %s", warning)
+
+if MEASUREMENT_SCHEDULE_MODE == "fixed":
+    fixed_times_text = ", ".join(minute_to_hhmm(m) for m in SCHEDULE_CHECK_MINUTES)
+    log.info("Sampling schedule mode: fixed times (%s)", fixed_times_text)
+else:
+    log.info("Sampling schedule mode: cadence (%d minutes)", MEASUREMENT_CADENCE_MINUTES)
+
+
+def get_minute_of_day(dt: datetime) -> int:
+    """Return minutes since midnight for a datetime."""
+    return dt.hour * 60 + dt.minute
+
+
+def get_slot_start_for_timestamp(dt: datetime) -> int:
+    """Map a timestamp to a schedule slot start (minute of day)."""
+    minute_of_day = get_minute_of_day(dt)
+    if MEASUREMENT_SCHEDULE_MODE == "cadence":
+        cadence = MEASUREMENT_CADENCE_MINUTES
+        return (minute_of_day // cadence) * cadence
+
+    # For fixed-time mode, map to the closest configured sample time.
+    nearest = min(
+        SCHEDULE_SLOT_STARTS,
+        key=lambda configured: min(
+            abs(minute_of_day - configured),
+            1440 - abs(minute_of_day - configured),
+        ),
+    )
+    return nearest
+
+
+def get_slot_duration_minutes(slot_start_minute: int) -> int:
+    """Return slot duration in minutes within the current day."""
+    if MEASUREMENT_SCHEDULE_MODE == "cadence":
+        return MEASUREMENT_CADENCE_MINUTES
+
+    idx = SCHEDULE_SLOT_STARTS.index(slot_start_minute)
+    next_start = SCHEDULE_SLOT_STARTS[(idx + 1) % len(SCHEDULE_SLOT_STARTS)]
+    if next_start > slot_start_minute:
+        return next_start - slot_start_minute
+    # Wrap-around: only count until midnight for this day's slot.
+    return 1440 - slot_start_minute
 
 # ─── Solar calculations ──────────────────────────────────────────────────────
 
@@ -178,8 +404,7 @@ def is_daylight(dt: datetime) -> bool:
 def classify_daylight_phase(dt: datetime) -> str:
     """Return one of: nighttime, transition, daylight.
 
-    The camera only appears to evaluate its own power state on a 15-minute cadence,
-    so immediately after the adjusted dawn boundary and immediately before the
+    Immediately after the adjusted dawn boundary and immediately before the
     adjusted dusk boundary we treat an offline camera as transitional rather than
     definitively "no power".
     """
@@ -194,8 +419,8 @@ def classify_daylight_phase(dt: datetime) -> str:
 
 # ─── Stream checks ───────────────────────────────────────────────────────────
 
-def check_stream_available(timeout: int = 10) -> tuple[bool, dict[str, str]]:
-    """Return stream availability plus diagnostic details for the HLS URL."""
+def check_stream_available_once(timeout: int = STREAM_CHECK_TIMEOUT_SECONDS) -> tuple[bool, dict[str, str]]:
+    """Run one stream availability check and return diagnostics."""
     try:
         resp = requests.get(STREAM_URL, timeout=timeout)
         playlist_ok = resp.status_code == 200 and "#EXTM3U" in resp.text[:256]
@@ -218,6 +443,59 @@ def check_stream_available(timeout: int = 10) -> tuple[bool, dict[str, str]]:
             "playlist_ok": "False",
             "request_error": str(exc),
         }
+
+
+def check_stream_available(
+    timeout: int = STREAM_CHECK_TIMEOUT_SECONDS,
+    retries: int = STREAM_CHECK_RETRIES,
+    retry_delay_seconds: float = STREAM_CHECK_RETRY_DELAY_SECONDS,
+) -> tuple[bool, dict[str, str]]:
+    """Return stream availability plus diagnostics, with short retries on failure."""
+    total_attempts = max(1, retries + 1)
+    last_details = {
+        "http_status": "",
+        "content_type": "",
+        "content_encoding": "",
+        "playlist_ok": "False",
+        "request_error": "",
+    }
+
+    for attempt in range(1, total_attempts + 1):
+        stream_up, details = check_stream_available_once(timeout=timeout)
+        if stream_up:
+            if attempt > 1:
+                log.info("Stream recovered on retry %d/%d", attempt, total_attempts)
+            return True, details
+
+        last_details = details
+        if attempt < total_attempts:
+            status = details.get("http_status", "") or "n/a"
+            error = details.get("request_error", "") or "none"
+            log.warning(
+                "Stream check attempt %d/%d failed (http_status=%s, request_error=%s); retrying in %.1fs",
+                attempt,
+                total_attempts,
+                status,
+                error,
+                retry_delay_seconds,
+            )
+            time.sleep(max(0.0, retry_delay_seconds))
+
+    status = last_details.get("http_status", "") or "n/a"
+    error = last_details.get("request_error", "") or "none"
+    log.warning(
+        "Stream check failed after %d attempts (http_status=%s, request_error=%s)",
+        total_attempts,
+        status,
+        error,
+    )
+    if total_attempts > 1:
+        suffix = f" after {total_attempts} attempts"
+        if last_details.get("request_error", ""):
+            last_details["request_error"] = f"{last_details['request_error']}{suffix}"
+        else:
+            last_details["request_error"] = f"stream unavailable{suffix}"
+    return False, last_details
 
 
 def grab_frame() -> tuple[Optional[Image.Image], str]:
@@ -383,14 +661,20 @@ def read_log() -> list[tuple[datetime, str]]:
     return entries
 
 
-def get_daily_state_minutes(entries: list[tuple[datetime, str]], target_date) -> dict[str, int]:
-    """Summarize one date into 15-minute totals per state."""
+def get_day_slot_state_map(entries: list[tuple[datetime, str]], target_date) -> dict[int, str]:
+    """Return the latest state per configured slot for a specific date."""
     slots: dict[int, str] = {}
     for dt, state in entries:
         if dt.date() != target_date:
             continue
-        slot = (dt.hour * 60 + dt.minute) // 15
-        slots[slot] = state
+        slot_start = get_slot_start_for_timestamp(dt)
+        slots[slot_start] = state
+    return slots
+
+
+def get_daily_state_minutes(entries: list[tuple[datetime, str]], target_date) -> dict[str, int]:
+    """Summarize one date into schedule-slot totals per state."""
+    slots = get_day_slot_state_map(entries, target_date)
 
     minutes = {
         STATE_ONLINE_OK: 0,
@@ -398,8 +682,8 @@ def get_daily_state_minutes(entries: list[tuple[datetime, str]], target_date) ->
         STATE_OFFLINE_NOPOWER: 0,
         STATE_OFFLINE_SAVING: 0,
     }
-    for state in slots.values():
-        minutes[state] = minutes.get(state, 0) + 15
+    for slot_start, state in slots.items():
+        minutes[state] = minutes.get(state, 0) + get_slot_duration_minutes(slot_start)
     return minutes
 
 
@@ -417,7 +701,8 @@ def get_no_power_alert_threshold_minutes(target_date) -> int:
     if expected_minutes <= 0:
         return 0
     threshold = int(expected_minutes * NO_POWER_ALERT_THRESHOLD_FRACTION)
-    return max(15, threshold)
+    minimum_granularity = min(get_slot_duration_minutes(slot) for slot in SCHEDULE_SLOT_STARTS)
+    return max(minimum_granularity, threshold)
 
 
 def read_report_state() -> dict:
@@ -807,8 +1092,8 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
       P = Offline - PowerSaving
       space = no data
 
-    The chart keeps all 4 quarter-hour samples per hour. It is intended to
-    be wrapped in a code block / preformatted block by the caller.
+    It is intended to be wrapped in a code block / preformatted block by
+    the caller.
     """
     entries = read_log()
     if not entries:
@@ -818,16 +1103,6 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
     end_date = now.date()
     start_date = end_date - timedelta(days=days - 1)
 
-    from collections import defaultdict
-
-    grid: dict[str, dict[int, str]] = defaultdict(dict)
-    for dt, state in entries:
-        if dt.date() < start_date or dt.date() > end_date:
-            continue
-        date_key = dt.strftime("%Y-%m-%d")
-        slot = (dt.hour * 60 + dt.minute) // 15
-        grid[date_key][slot] = state
-
     symbol_map = {
         STATE_ONLINE_OK: "O",
         STATE_ONLINE_LOWPOWER: "L",
@@ -835,23 +1110,20 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
         STATE_OFFLINE_SAVING: "P",
     }
 
-    axis_blocks = []
-    for hour in range(24):
-        label = f"{hour % 12 or 12}{'A' if hour < 12 else 'P'}"
-        axis_blocks.append(f"{label:<4}")
-    axis_line = "".join(axis_blocks).rstrip()
-
-    lines = ["Each character is one 15-minute period."]
+    if MEASUREMENT_SCHEDULE_MODE == "cadence":
+        lines = [f"Each character is one {MEASUREMENT_CADENCE_MINUTES}-minute schedule slot."]
+    else:
+        lines = ["Each character is one configured fixed-time slot."]
+        lines.append("Slot order: " + ", ".join(minute_to_hhmm(m) for m in SCHEDULE_SLOT_STARTS))
 
     d = start_date
     while d <= end_date:
-        date_key = d.strftime("%Y-%m-%d")
-        row = "".join(symbol_map.get(grid.get(date_key, {}).get(slot_idx), " ") for slot_idx in range(96)).rstrip()
+        slots = get_day_slot_state_map(entries, d)
+        row = "".join(symbol_map.get(slots.get(slot_start), " ") for slot_start in SCHEDULE_SLOT_STARTS).rstrip()
         lines.append(f"{d:%m/%d/%Y} {row}".rstrip())
         d += timedelta(days=1)
 
-    lines.append(" " * 11 + axis_line)
-    lines.append(" " * 11 + "Legend:      O=OK            X=NoPower            P=PowerSaver            L=LowPower")
+    lines.append("Legend: O=OK  X=NoPower  P=PowerSaver  L=LowPower")
 
     return "\n".join(lines)
 
@@ -945,21 +1217,18 @@ def send_alerttest() -> None:
 
 
 def get_next_scheduled_check(after: Optional[datetime] = None) -> datetime:
-    """Return the next check time aligned near the end of a 15-minute block."""
+    """Return the next scheduled check datetime."""
     if after is None:
         after = datetime.now()
 
-    base = after.replace(second=0, microsecond=0)
-    minutes_to_add = CHECK_INTERVAL_SECONDS // 60 - (base.minute % (CHECK_INTERVAL_SECONDS // 60)) - 1
-    if minutes_to_add < 0:
-        minutes_to_add += CHECK_INTERVAL_SECONDS // 60
-    scheduled = base + timedelta(minutes=minutes_to_add)
-    scheduled = scheduled.replace(second=CHECK_TARGET_SECOND)
-
-    if scheduled <= after:
-        scheduled += timedelta(minutes=CHECK_INTERVAL_SECONDS // 60)
-        scheduled = scheduled.replace(second=CHECK_TARGET_SECOND)
-    return scheduled
+    for day_offset in (0, 1, 2):
+        day = after.date() + timedelta(days=day_offset)
+        day_start = datetime.combine(day, datetime.min.time())
+        for minute_of_day in SCHEDULE_CHECK_MINUTES:
+            scheduled = day_start + timedelta(minutes=minute_of_day, seconds=CHECK_TARGET_SECOND)
+            if scheduled > after:
+                return scheduled
+    raise RuntimeError("Could not determine next scheduled check time.")
 
 
 def read_last_reported_date() -> Optional[str]:
@@ -979,8 +1248,8 @@ def write_last_reported_date(report_date: str) -> None:
 
 
 def maybe_send_end_of_day_report(now: datetime) -> None:
-    # Trigger after the final aligned late-night sample (23:44:50, 23:59:50, etc.)
-    if now.hour != 23 or now.minute < 45:
+    # Trigger after the final configured check time each day.
+    if get_minute_of_day(now) < max(SCHEDULE_CHECK_MINUTES):
         return
 
     report_date = now.date().isoformat()
@@ -998,31 +1267,17 @@ def maybe_send_end_of_day_report(now: datetime) -> None:
 def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
     """Generate a horizontal timeline chart from the log file.
 
-    Each row is one calendar day. Each 15-minute slot is colored by state.
+    Each row is one calendar day. Each configured schedule slot is colored by state.
     """
     entries = read_log()
     if not entries:
-        log.warning("No log entries — cannot generate chart.")
+        log.warning("No log entries - cannot generate chart.")
         return
 
     now = datetime.now()
-    # Determine date range
     end_date = now.date()
     start_date = end_date - timedelta(days=days - 1)
 
-    # Bucket entries by date and 15-min slot
-    # slot index: 0 = 00:00, 1 = 00:15, ..., 95 = 23:45
-    from collections import defaultdict
-    grid: dict[str, dict[int, str]] = defaultdict(dict)
-
-    for dt, state in entries:
-        if dt.date() < start_date or dt.date() > end_date:
-            continue
-        date_key = dt.strftime("%Y-%m-%d")
-        slot = (dt.hour * 60 + dt.minute) // 15
-        grid[date_key][slot] = state
-
-    # Build the list of dates to display
     dates = []
     d = start_date
     while d <= end_date:
@@ -1030,33 +1285,33 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
         d += timedelta(days=1)
 
     if not dates:
-        log.warning("No dates in range — cannot generate chart.")
+        log.warning("No dates in range - cannot generate chart.")
         return
 
-    # ── Plot ──────────────────────────────────────────────────────────────
     n_days = len(dates)
     fig_height = max(3, 0.55 * n_days + 1.4)
     fig, ax = plt.subplots(figsize=(16, fig_height))
 
     band_height = 2 / 3
     divider_linewidth = 0.8
-    endcap_radius_minutes = 7.5
+    endcap_radius_minutes = 6.0
 
     for row_idx, date in enumerate(reversed(dates)):
-        date_key = date.strftime("%Y-%m-%d")
-        slots = grid.get(date_key, {})
+        slots = get_day_slot_state_map(entries, date)
         if slots:
-            day_start = min(slots)
-            day_end = max(slots) + 1
-
-            for slot_idx in range(day_start, day_end):
-                state = slots.get(slot_idx)
-                if state is None:
-                    continue
+            segment_bounds: list[tuple[int, int]] = []
+            for slot_start in sorted(slots):
+                state = slots[slot_start]
                 color = STATE_COLORS.get(state, "#cccccc")
+                width_minutes = get_slot_duration_minutes(slot_start)
+                segment_start = slot_start
+                segment_end = min(24 * 60, slot_start + width_minutes)
+                if segment_end <= segment_start:
+                    continue
+                segment_bounds.append((segment_start, segment_end))
                 slot_patch = mpatches.Rectangle(
-                    (slot_idx * 15, row_idx - (band_height / 2)),
-                    15,
+                    (segment_start, row_idx - (band_height / 2)),
+                    segment_end - segment_start,
                     band_height,
                     linewidth=0,
                     facecolor=color,
@@ -1065,12 +1320,13 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                 )
                 ax.add_patch(slot_patch)
 
-            first_state = slots.get(day_start)
-            last_state = slots.get(day_end - 1)
-            if first_state is not None:
+            first_start = min(slots)
+            first_state = slots[first_start]
+            first_end = min(24 * 60, first_start + get_slot_duration_minutes(first_start))
+            if first_end > first_start:
                 ax.add_patch(
                     mpatches.Ellipse(
-                        (day_start * 15, row_idx),
+                        (first_start, row_idx),
                         width=2 * endcap_radius_minutes,
                         height=band_height,
                         facecolor=STATE_COLORS.get(first_state, "#cccccc"),
@@ -1078,10 +1334,14 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                         zorder=2,
                     )
                 )
-            if last_state is not None:
+
+            last_start = max(slots)
+            last_state = slots[last_start]
+            last_end = min(24 * 60, last_start + get_slot_duration_minutes(last_start))
+            if last_end > last_start:
                 ax.add_patch(
                     mpatches.Ellipse(
-                        (day_end * 15, row_idx),
+                        (last_end, row_idx),
                         width=2 * endcap_radius_minutes,
                         height=band_height,
                         facecolor=STATE_COLORS.get(last_state, "#cccccc"),
@@ -1090,20 +1350,17 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                     )
                 )
 
-        divider_ymin = row_idx - (band_height / 2)
-        divider_ymax = row_idx + (band_height / 2)
-        for boundary_slot in range(1, 96):
-            if slots.get(boundary_slot - 1) is None or slots.get(boundary_slot) is None:
-                continue
-            x_boundary = boundary_slot * 15
-            divider, = ax.plot(
-                [x_boundary, x_boundary],
-                [divider_ymin, divider_ymax],
-                color="black",
-                linewidth=divider_linewidth,
-                solid_capstyle="butt",
-                zorder=3,
-            )
+            divider_ymin = row_idx - (band_height / 2)
+            divider_ymax = row_idx + (band_height / 2)
+            for _, segment_end in segment_bounds[:-1]:
+                divider, = ax.plot(
+                    [segment_end, segment_end],
+                    [divider_ymin, divider_ymax],
+                    color="black",
+                    linewidth=divider_linewidth,
+                    solid_capstyle="butt",
+                    zorder=3,
+                )
 
     # Y-axis: date labels
     y_labels = [d.strftime("%-m/%-d/%Y") for d in reversed(dates)]
@@ -1132,10 +1389,10 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
 
     # Legend
     legend_patches = [
-        mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_OK],       label="Online - OK"),
+        mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_OK], label="Online - OK"),
         mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_LOWPOWER], label="Online - Low Power"),
         mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_NOPOWER], label="Offline - No Power"),
-        mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_SAVING],  label="Offline - PowerSaving"),
+        mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_SAVING], label="Offline - PowerSaving"),
     ]
     ax.legend(
         handles=legend_patches,
@@ -1175,7 +1432,7 @@ def run_once(now: Optional[datetime] = None) -> str:
 
 
 def run_loop() -> None:
-    """Run checks continuously on a 15-minute aligned schedule."""
+    """Run checks continuously on the configured schedule."""
     log.info("Starting continuous monitoring with an immediate startup check")
     try:
         run_once()
@@ -1185,7 +1442,7 @@ def run_loop() -> None:
     while True:
         next_check = get_next_scheduled_check()
         sleep_seconds = max(0.0, (next_check - datetime.now()).total_seconds())
-        log.info("Next aligned check at %s", next_check.strftime("%Y-%m-%d %H:%M:%S"))
+        log.info("Next scheduled check at %s", next_check.strftime("%Y-%m-%d %H:%M:%S"))
         time.sleep(sleep_seconds)
         try:
             run_once(now=next_check)
@@ -1200,7 +1457,7 @@ def main() -> None:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Run continuously every 15 minutes.",
+        help="Run continuously on the configured schedule.",
     )
     parser.add_argument(
         "--chart",
@@ -1256,3 +1513,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

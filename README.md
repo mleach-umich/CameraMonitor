@@ -3,7 +3,7 @@
 Monitor and report the status of the UMCI construction camera.
 
 This project:
-- checks the camera stream on a 15-minute cadence
+- checks the camera stream on a configurable schedule
 - classifies each sample as `Online - OK`, `Online - Low Power`, `Offline - No Power`, or `Offline - PowerSaving`
 - logs results to CSV
 - generates a 14-day timeline chart
@@ -13,9 +13,9 @@ This project:
 ## What It Tracks
 
 The monitor evaluates the camera against an adjusted daylight window for Ann Arbor, Michigan:
-- latitude: `42.325`
-- longitude: `-83.05`
-- timezone: `America/New_York`
+- latitude (default): `42.325` (`CAMERA_LATITUDE`)
+- longitude (default): `-83.05` (`CAMERA_LONGITUDE`)
+- timezone (default): `America/New_York` (`CAMERA_TIMEZONE`)
 - daylight start: `dawn - 10 minutes`
 - daylight end: `dusk - 5 minutes`
 
@@ -66,9 +66,13 @@ docker compose exec -T webcam-monitor python /app/webcam_monitor.py --chart 14
 
 When the container starts in loop mode, it:
 1. performs an immediate startup sample
-2. continues sampling on a 15-minute aligned schedule near the end of each reporting period
+2. continues sampling on the configured schedule
 
 That means you get fast feedback after restarts, but normal operation lines up with the reporting blocks instead of drifting based on container start time.
+
+Scheduling modes:
+- `MEASUREMENT_SCHEDULE_MODE=cadence`: uses `MEASUREMENT_CADENCE_MINUTES` (`15`, `30`, `60`, `120`, `240`, or `480`).
+- `MEASUREMENT_SCHEDULE_MODE=fixed`: uses up to 4 daily times from `MEASUREMENT_FIXED_TIMES` (comma-separated `HH:MM`).
 
 ## Daily Email Reports
 
@@ -77,6 +81,21 @@ The monitor supports SMTP-based daily reporting.
 Relevant environment variables:
 
 ```env
+STREAM_URL=https://558312d54930d.streamlock.net/live/umci.fois.axis.stream/playlist.m3u8
+CAMERA_LATITUDE=42.325
+CAMERA_LONGITUDE=-83.05
+CAMERA_TIMEZONE=America/New_York
+MEASUREMENT_SCHEDULE_MODE=cadence
+MEASUREMENT_CADENCE_MINUTES=15
+MEASUREMENT_FIXED_TIMES=
+CHECK_TARGET_SECOND=50
+CAMERA_TRANSITION_GRACE_MINUTES=15
+NO_POWER_ALERT_THRESHOLD_FRACTION=0.33
+FFMPEG_TIMEOUT_SECONDS=20
+STREAM_CHECK_TIMEOUT_SECONDS=10
+STREAM_CHECK_RETRIES=2
+STREAM_CHECK_RETRY_DELAY_SECONDS=2.0
+RED_PIXEL_RATIO=0.005
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USERNAME=youraccount@gmail.com
@@ -86,6 +105,15 @@ EMAIL_TO=recipient@example.com
 SMTP_USE_TLS=true
 SLACK_REPORT_NAME=UMCI Camera Monitor
 ```
+
+Tuning notes:
+- `MEASUREMENT_SCHEDULE_MODE` supports `cadence` or `fixed`.
+- `MEASUREMENT_CADENCE_MINUTES` allows only: `15`, `30`, `60`, `120`, `240`, `480`.
+- `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.
+- `STREAM_CHECK_RETRIES` and `STREAM_CHECK_RETRY_DELAY_SECONDS` reduce false `Offline - No Power` events during brief network hiccups.
+- `NO_POWER_ALERT_THRESHOLD_FRACTION` controls when a no-power alert is sent for the day (default `0.33` means 33% of expected power-on time).
+- `CAMERA_TRANSITION_GRACE_MINUTES` softens classification around dawn/dusk transitions.
+- Invalid env values are logged at startup and safely fall back to defaults.
 
 The daily email includes:
 - summary totals for the most recent completed day
