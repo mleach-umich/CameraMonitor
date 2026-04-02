@@ -39,6 +39,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import smtplib
 import subprocess
 import sys
@@ -54,6 +55,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.patches as mpatches
+import matplotlib.lines as mlines
 from matplotlib.collections import PolyCollection
 
 import numpy as np
@@ -144,6 +146,30 @@ def get_env_choice(name: str, default: str, allowed: set[str]) -> str:
         add_config_warning(f"{name}={raw!r} is invalid; allowed values: {allowed_values}. Using default {default}.")
         return default
     return normalized
+
+
+def get_env_bool(name: str, default: bool) -> bool:
+    """Read a boolean from env, accepting common true/false spellings."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw == "":
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    add_config_warning(f"{name}={raw!r} is not a valid boolean; using default {default}.")
+    return default
+
+
+def get_env_hex_color(name: str, default: str) -> str:
+    """Read a hex color like #RRGGBB or #RGB from env."""
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return default
+    if re.fullmatch(r"#(?:[0-9A-Fa-f]{6}|[0-9A-Fa-f]{3})", raw):
+        return raw
+    add_config_warning(f"{name}={raw!r} is not a valid hex color; using default {default}.")
+    return default
 
 
 def get_env_timezone(name: str, default: str) -> str:
@@ -288,12 +314,42 @@ LAMBDA_WEBHOOK_URL = os.environ.get(
     "LAMBDA_WEBHOOK_URL",
     "https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook",
 ).strip()
+SEND_ASCII_CHART_TO_SLACK = get_env_bool("SEND_ASCII_CHART_TO_SLACK", False)
+WEATHER_SHOW_DURING_POWERSAVING = get_env_bool("WEATHER_SHOW_DURING_POWERSAVING", True)
+NWS_STATION = os.environ.get("NWS_STATION", "KDTW").strip().upper()
+if not NWS_STATION:
+    add_config_warning("NWS_STATION is empty; using default KDTW.")
+    NWS_STATION = "KDTW"
+NWS_API_BASE_URL = os.environ.get("NWS_API_BASE_URL", "https://api.weather.gov").strip().rstrip("/")
+if not NWS_API_BASE_URL:
+    add_config_warning("NWS_API_BASE_URL is empty; using default https://api.weather.gov.")
+    NWS_API_BASE_URL = "https://api.weather.gov"
 
 # How many seconds ffmpeg is allowed to attempt frame capture
 FFMPEG_TIMEOUT = get_env_int("FFMPEG_TIMEOUT_SECONDS", 20, min_value=1)
 STREAM_CHECK_TIMEOUT_SECONDS = get_env_int("STREAM_CHECK_TIMEOUT_SECONDS", 10, min_value=1)
 STREAM_CHECK_RETRIES = get_env_int("STREAM_CHECK_RETRIES", 2, min_value=0)
 STREAM_CHECK_RETRY_DELAY_SECONDS = get_env_float("STREAM_CHECK_RETRY_DELAY_SECONDS", 2.0, min_value=0.0)
+NWS_REQUEST_TIMEOUT_SECONDS = get_env_int("NWS_REQUEST_TIMEOUT_SECONDS", 10, min_value=1)
+NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "").strip() or (
+    f"{SLACK_REPORT_NAME}/1.0 ({EMAIL_FROM or 'webcam-monitor@local'})"
+)
+WEATHER_OVERLAY_LINE_WIDTH = get_env_float("WEATHER_OVERLAY_LINE_WIDTH", 2.6, min_value=0.2, max_value=12.0)
+WEATHER_OVERLAY_ICON_SIZE = get_env_float("WEATHER_OVERLAY_ICON_SIZE", 64.0, min_value=4.0, max_value=1200.0)
+WEATHER_OVERLAY_ICON_EDGE_WIDTH = get_env_float(
+    "WEATHER_OVERLAY_ICON_EDGE_WIDTH",
+    0.7,
+    min_value=0.0,
+    max_value=5.0,
+)
+WEATHER_OVERLAY_ALPHA = get_env_float("WEATHER_OVERLAY_ALPHA", 0.9, min_value=0.0, max_value=1.0)
+WEATHER_LEGEND_LINE_WIDTH = get_env_float("WEATHER_LEGEND_LINE_WIDTH", 2.8, min_value=0.2, max_value=12.0)
+WEATHER_LEGEND_MARKER_SIZE = get_env_float("WEATHER_LEGEND_MARKER_SIZE", 8.0, min_value=2.0, max_value=24.0)
+WEATHER_COLOR_CLEAR = get_env_hex_color("WEATHER_COLOR_CLEAR", "#fff200")
+WEATHER_COLOR_PARTLY = get_env_hex_color("WEATHER_COLOR_PARTLY", "#2563eb")
+WEATHER_COLOR_MOSTLY = get_env_hex_color("WEATHER_COLOR_MOSTLY", "#94a3b8")
+WEATHER_COLOR_OVERCAST = get_env_hex_color("WEATHER_COLOR_OVERCAST", "#475569")
+WEATHER_COLOR_UNKNOWN = get_env_hex_color("WEATHER_COLOR_UNKNOWN", "#d1d5db")
 
 # Detection thresholds for "low power" red text
 # We look at the top-left overlay region of the captured frame
@@ -316,6 +372,56 @@ STATE_COLORS = {
     STATE_OFFLINE_SAVING:  "#c0c0c0",  # gray
 }
 
+# Weather cloud-cover categories
+CLOUD_COVER_CLEAR = "Sunny/Clear"
+CLOUD_COVER_PARTLY = "Partly Cloudy"
+CLOUD_COVER_MOSTLY = "Mostly Cloudy"
+CLOUD_COVER_OVERCAST = "Overcast"
+CLOUD_COVER_UNKNOWN = "Unknown"
+
+CLOUD_COVER_COLORS = {
+    CLOUD_COVER_CLEAR: WEATHER_COLOR_CLEAR,
+    CLOUD_COVER_PARTLY: WEATHER_COLOR_PARTLY,
+    CLOUD_COVER_MOSTLY: WEATHER_COLOR_MOSTLY,
+    CLOUD_COVER_OVERCAST: WEATHER_COLOR_OVERCAST,
+    CLOUD_COVER_UNKNOWN: WEATHER_COLOR_UNKNOWN,
+}
+
+CLOUD_COVER_ICON_MARKERS = {
+    CLOUD_COVER_CLEAR: "*",
+    CLOUD_COVER_PARTLY: "o",
+    CLOUD_COVER_MOSTLY: "D",
+    CLOUD_COVER_OVERCAST: "s",
+    CLOUD_COVER_UNKNOWN: "x",
+}
+
+DIAGNOSTICS_FIELDNAMES = [
+    "timestamp",
+    "state",
+    "is_daylight",
+    "daylight_phase",
+    "http_status",
+    "content_type",
+    "content_encoding",
+    "playlist_ok",
+    "frame_captured",
+    "ffmpeg_status",
+    "request_error",
+    "weather_station",
+    "weather_http_status",
+    "weather_observed_at_utc",
+    "weather_text",
+    "cloud_cover_code",
+    "cloud_cover_type",
+    "weather_error",
+]
+
+TIMESTAMP_FORMATS = [
+    "%Y-%m-%d %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y %H:%M:%S",
+]
+
 # ─── Logging setup ────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -333,6 +439,9 @@ if MEASUREMENT_SCHEDULE_MODE == "fixed":
     log.info("Sampling schedule mode: fixed times (%s)", fixed_times_text)
 else:
     log.info("Sampling schedule mode: cadence (%d minutes)", MEASUREMENT_CADENCE_MINUTES)
+log.info("NWS weather station: %s", NWS_STATION)
+log.info("Include ASCII chart in Slack/webhook text: %s", SEND_ASCII_CHART_TO_SLACK)
+log.info("Show weather overlay during power-saving bands: %s", WEATHER_SHOW_DURING_POWERSAVING)
 
 
 def get_minute_of_day(dt: datetime) -> int:
@@ -498,6 +607,74 @@ def check_stream_available(
     return False, last_details
 
 
+def classify_cloud_cover(cloud_cover_code: str, weather_text: str) -> str:
+    """Classify cloud cover from NWS layer code and text description."""
+    code = (cloud_cover_code or "").upper().strip()
+    if code in {"CLR", "SKC", "NCD", "NSC"}:
+        return CLOUD_COVER_CLEAR
+    if code in {"FEW", "SCT"}:
+        return CLOUD_COVER_PARTLY
+    if code == "BKN":
+        return CLOUD_COVER_MOSTLY
+    if code in {"OVC", "VV"}:
+        return CLOUD_COVER_OVERCAST
+
+    desc = (weather_text or "").lower()
+    if "mostly sunny" in desc or "partly sunny" in desc or "partly cloudy" in desc:
+        return CLOUD_COVER_PARTLY
+    if "mostly cloudy" in desc:
+        return CLOUD_COVER_MOSTLY
+    if "overcast" in desc or "cloudy" in desc:
+        return CLOUD_COVER_OVERCAST
+    if "sunny" in desc or "clear" in desc or "fair" in desc:
+        return CLOUD_COVER_CLEAR
+    return CLOUD_COVER_UNKNOWN
+
+
+def get_latest_nws_cloud_cover(timeout: int = NWS_REQUEST_TIMEOUT_SECONDS) -> dict[str, str]:
+    """Fetch cloud-cover details from NWS for the configured station."""
+    details = {
+        "weather_station": NWS_STATION,
+        "weather_http_status": "",
+        "weather_observed_at_utc": "",
+        "weather_text": "",
+        "cloud_cover_code": "",
+        "cloud_cover_type": CLOUD_COVER_UNKNOWN,
+        "weather_error": "",
+    }
+    if not NWS_STATION:
+        details["weather_error"] = "NWS station is not configured"
+        return details
+
+    url = f"{NWS_API_BASE_URL}/stations/{NWS_STATION}/observations/latest"
+    headers = {
+        "Accept": "application/geo+json",
+        "User-Agent": NWS_USER_AGENT,
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        details["weather_http_status"] = str(resp.status_code)
+        if not resp.ok:
+            details["weather_error"] = f"HTTP {resp.status_code}"
+            return details
+
+        payload = resp.json().get("properties", {})
+        text_description = (payload.get("textDescription") or "").strip()
+        cloud_layers = payload.get("cloudLayers") or []
+        cloud_cover_code = ""
+        if cloud_layers and isinstance(cloud_layers, list):
+            cloud_cover_code = str(cloud_layers[0].get("amount") or "").upper().strip()
+
+        details["weather_observed_at_utc"] = (payload.get("timestamp") or "").strip()
+        details["weather_text"] = text_description
+        details["cloud_cover_code"] = cloud_cover_code
+        details["cloud_cover_type"] = classify_cloud_cover(cloud_cover_code, text_description)
+        return details
+    except Exception as exc:
+        details["weather_error"] = str(exc)
+        return details
+
+
 def grab_frame() -> tuple[Optional[Image.Image], str]:
     """Use ffmpeg to capture a single frame from the HLS stream.
 
@@ -564,6 +741,7 @@ def determine_state(now: Optional[datetime] = None) -> tuple[str, dict[str, str]
 
     daylight_phase = classify_daylight_phase(now)
     stream_up, diagnostics = check_stream_available()
+    diagnostics.update(get_latest_nws_cloud_cover())
     diagnostics["is_daylight"] = str(daylight_phase != "nighttime")
     diagnostics["daylight_phase"] = daylight_phase
 
@@ -602,32 +780,17 @@ def append_diagnostics_log(dt: datetime, state: str, diagnostics: dict[str, str]
     with open(DIAGNOSTICS_FILE, "a", newline="") as f:
         writer = csv.writer(f)
         if is_new:
-            writer.writerow([
-                "timestamp",
-                "state",
-                "is_daylight",
-                "daylight_phase",
-                "http_status",
-                "content_type",
-                "content_encoding",
-                "playlist_ok",
-                "frame_captured",
-                "ffmpeg_status",
-                "request_error",
-            ])
-        writer.writerow([
-            dt.strftime("%Y-%m-%d %H:%M:%S"),
-            state,
-            diagnostics.get("is_daylight", ""),
-            diagnostics.get("daylight_phase", ""),
-            diagnostics.get("http_status", ""),
-            diagnostics.get("content_type", ""),
-            diagnostics.get("content_encoding", ""),
-            diagnostics.get("playlist_ok", ""),
-            diagnostics.get("frame_captured", ""),
-            diagnostics.get("ffmpeg_status", ""),
-            diagnostics.get("request_error", ""),
-        ])
+            writer.writerow(DIAGNOSTICS_FIELDNAMES)
+
+        row = {
+            "timestamp": dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "state": state,
+        }
+        for key in DIAGNOSTICS_FIELDNAMES:
+            if key in row:
+                continue
+            row[key] = diagnostics.get(key, "")
+        writer.writerow([row.get(key, "") for key in DIAGNOSTICS_FIELDNAMES])
 
 
 def read_log() -> list[tuple[datetime, str]]:
@@ -635,11 +798,6 @@ def read_log() -> list[tuple[datetime, str]]:
     if not LOG_FILE.exists():
         return []
     entries = []
-    timestamp_formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-    ]
     with open(LOG_FILE, "r") as f:
         reader = csv.reader(f)
         first_row = next(reader, None)
@@ -651,7 +809,7 @@ def read_log() -> list[tuple[datetime, str]]:
                 rows = [first_row, *reader]
         for row in rows:
             if len(row) >= 2:
-                for fmt in timestamp_formats:
+                for fmt in TIMESTAMP_FORMATS:
                     try:
                         dt = datetime.strptime(row[0], fmt)
                         entries.append((dt, row[1]))
@@ -659,6 +817,102 @@ def read_log() -> list[tuple[datetime, str]]:
                     except ValueError:
                         continue
     return entries
+
+
+def parse_timestamp(value: str) -> Optional[datetime]:
+    """Parse a timestamp value using accepted log formats."""
+    for fmt in TIMESTAMP_FORMATS:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_cloud_cover_from_diagnostics_row(row: dict, fieldnames: list[str]) -> str:
+    """Extract cloud-cover type from a diagnostics row, including legacy-header rows."""
+    cloud_cover_type = (row.get("cloud_cover_type") or "").strip()
+    cloud_cover_code = (row.get("cloud_cover_code") or "").strip()
+    weather_text = (row.get("weather_text") or "").strip()
+
+    # Legacy compatibility: when new columns are appended to an older header,
+    # csv.DictReader stores extra values under the None key.
+    extras = row.get(None) or []
+    if extras:
+        known_fields = [name for name in fieldnames if name is not None]
+        missing_fields = [name for name in DIAGNOSTICS_FIELDNAMES if name not in known_fields]
+        extras_map = {
+            missing_fields[idx]: extras[idx]
+            for idx in range(min(len(missing_fields), len(extras)))
+        }
+        cloud_cover_type = cloud_cover_type or str(extras_map.get("cloud_cover_type", "")).strip()
+        cloud_cover_code = cloud_cover_code or str(extras_map.get("cloud_cover_code", "")).strip()
+        weather_text = weather_text or str(extras_map.get("weather_text", "")).strip()
+
+    if cloud_cover_type:
+        return cloud_cover_type
+    if cloud_cover_code or weather_text:
+        return classify_cloud_cover(cloud_cover_code, weather_text)
+    return ""
+
+
+def read_weather_slot_map(start_date, end_date) -> dict[str, dict[int, str]]:
+    """Read cloud-cover categories from diagnostics and bucket by date/slot."""
+    if not DIAGNOSTICS_FILE.exists():
+        return {}
+
+    from collections import defaultdict
+
+    grid: dict[str, dict[int, str]] = defaultdict(dict)
+    with open(DIAGNOSTICS_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        if "timestamp" not in fieldnames:
+            return {}
+
+        for row in reader:
+            ts = (row.get("timestamp") or "").strip()
+            if not ts:
+                continue
+            dt = parse_timestamp(ts)
+            if dt is None:
+                continue
+            if dt.date() < start_date or dt.date() > end_date:
+                continue
+
+            cloud_cover_type = extract_cloud_cover_from_diagnostics_row(row, fieldnames)
+            if not cloud_cover_type:
+                continue
+
+            slot_start = get_slot_start_for_timestamp(dt)
+            date_key = dt.strftime("%Y-%m-%d")
+            grid[date_key][slot_start] = cloud_cover_type
+    return grid
+
+
+def build_weather_segments(weather_slots: dict[int, str]) -> list[tuple[float, float, str]]:
+    """Collapse slot-level weather values into contiguous segments."""
+    if not weather_slots:
+        return []
+
+    segments: list[tuple[float, float, str]] = []
+    for slot_start in sorted(weather_slots):
+        weather_type = weather_slots[slot_start]
+        segment_start = float(slot_start)
+        segment_end = float(min(24 * 60, slot_start + get_slot_duration_minutes(slot_start)))
+        if segment_end <= segment_start:
+            continue
+
+        if not segments:
+            segments.append((segment_start, segment_end, weather_type))
+            continue
+
+        prev_start, prev_end, prev_type = segments[-1]
+        if prev_type == weather_type and abs(prev_end - segment_start) < 1e-6:
+            segments[-1] = (prev_start, segment_end, prev_type)
+        else:
+            segments.append((segment_start, segment_end, weather_type))
+    return segments
 
 
 def get_day_slot_state_map(entries: list[tuple[datetime, str]], target_date) -> dict[int, str]:
@@ -1152,14 +1406,24 @@ def post_lambda_webhook(payload: dict) -> None:
     log.info("Webhook POST completed with status %s", resp.status_code)
 
 
+def sanitize_webhook_html(html_body: str) -> str:
+    """Remove email-only inline CID images that Slack block conversion cannot use."""
+    return re.sub(
+        r'<img[^>]+src=["\']cid:[^"\']+["\'][^>]*>\s*',
+        "",
+        html_body,
+        flags=re.IGNORECASE,
+    )
+
+
 def send_daily_webhook_report(report_date=None) -> None:
     """Send the nightly report body to the lab data webhook."""
     report_content = build_daily_report_content(target_date=report_date)
-    chart_ascii = build_chart_ascii()
+    chart_ascii = build_chart_ascii() if SEND_ASCII_CHART_TO_SLACK else None
     text_body = report_content["plain"]
-    html_body = report_content["html"]
+    html_body = sanitize_webhook_html(report_content["html"])
 
-    if chart_ascii:
+    if chart_ascii and SEND_ASCII_CHART_TO_SLACK:
         text_body = f"{text_body}\n\nASCII chart\n```\n{chart_ascii}\n```"
         html_body = html_body.replace(
             "</body>",
@@ -1176,8 +1440,9 @@ def send_daily_webhook_report(report_date=None) -> None:
         "text": text_body,
         "html": html_body,
         "chart_image_base64_png": build_chart_base64(),
-        "chart_ascii_art": build_chart_ascii(),
     }
+    if chart_ascii and SEND_ASCII_CHART_TO_SLACK:
+        payload["chart_ascii_art"] = chart_ascii
     post_lambda_webhook(payload)
 
 
@@ -1288,16 +1553,20 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
         log.warning("No dates in range - cannot generate chart.")
         return
 
+    weather_grid = read_weather_slot_map(start_date, end_date)
+
     n_days = len(dates)
-    fig_height = max(3, 0.55 * n_days + 1.4)
+    fig_height = max(3.6, 0.7 * n_days + 1.8)
     fig, ax = plt.subplots(figsize=(16, fig_height))
 
-    band_height = 2 / 3
+    band_height = 0.78
     divider_linewidth = 0.8
     endcap_radius_minutes = 6.0
 
     for row_idx, date in enumerate(reversed(dates)):
+        date_key = date.strftime("%Y-%m-%d")
         slots = get_day_slot_state_map(entries, date)
+        weather_slots = weather_grid.get(date_key, {})
         if slots:
             segment_bounds: list[tuple[int, int]] = []
             for slot_start in sorted(slots):
@@ -1362,11 +1631,50 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                     zorder=3,
                 )
 
+            if WEATHER_SHOW_DURING_POWERSAVING:
+                chart_weather_slots = weather_slots
+            else:
+                chart_weather_slots = {
+                    slot_start: cloud_cover_type
+                    for slot_start, cloud_cover_type in weather_slots.items()
+                    if slots.get(slot_start) != STATE_OFFLINE_SAVING
+                }
+
+            weather_segments = build_weather_segments(chart_weather_slots)
+            weather_y = row_idx
+            for segment_start, segment_end, cloud_cover_type in weather_segments:
+                weather_color = CLOUD_COVER_COLORS.get(cloud_cover_type, CLOUD_COVER_COLORS[CLOUD_COVER_UNKNOWN])
+                ax.plot(
+                    [segment_start, segment_end],
+                    [weather_y, weather_y],
+                    color=weather_color,
+                    linewidth=WEATHER_OVERLAY_LINE_WIDTH,
+                    solid_capstyle="round",
+                    zorder=5,
+                    alpha=WEATHER_OVERLAY_ALPHA,
+                )
+
+                marker = CLOUD_COVER_ICON_MARKERS.get(cloud_cover_type, CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_UNKNOWN])
+                segment_width = segment_end - segment_start
+                icon_x = segment_start + min(8.0, max(2.0, segment_width * 0.2))
+                icon_x = min(max(segment_start + 1.0, icon_x), max(segment_start + 1.0, segment_end - 1.0))
+                ax.scatter(
+                    [icon_x],
+                    [weather_y],
+                    s=WEATHER_OVERLAY_ICON_SIZE,
+                    marker=marker,
+                    c=[weather_color],
+                    edgecolors="white",
+                    linewidths=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
+                    zorder=6,
+                    alpha=WEATHER_OVERLAY_ALPHA,
+                )
+
     # Y-axis: date labels
     y_labels = [d.strftime("%-m/%-d/%Y") for d in reversed(dates)]
     ax.set_yticks(range(n_days))
     ax.set_yticklabels(y_labels, fontsize=9)
-    ax.set_ylim(-0.5, n_days - 0.5)
+    ax.set_ylim(-0.55, n_days - 0.45)
 
     # X-axis: hours
     hour_ticks = list(range(0, 25 * 60, 60))
@@ -1393,13 +1701,65 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
         mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_LOWPOWER], label="Online - Low Power"),
         mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_NOPOWER], label="Offline - No Power"),
         mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_SAVING], label="Offline - PowerSaving"),
+        mlines.Line2D(
+            [],
+            [],
+            color=CLOUD_COVER_COLORS[CLOUD_COVER_CLEAR],
+            linewidth=WEATHER_LEGEND_LINE_WIDTH,
+            marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_CLEAR],
+            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_CLEAR],
+            markeredgecolor="white",
+            markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
+            alpha=WEATHER_OVERLAY_ALPHA,
+            label=f"Weather - {CLOUD_COVER_CLEAR}",
+        ),
+        mlines.Line2D(
+            [],
+            [],
+            color=CLOUD_COVER_COLORS[CLOUD_COVER_PARTLY],
+            linewidth=WEATHER_LEGEND_LINE_WIDTH,
+            marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_PARTLY],
+            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_PARTLY],
+            markeredgecolor="white",
+            markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
+            alpha=WEATHER_OVERLAY_ALPHA,
+            label=f"Weather - {CLOUD_COVER_PARTLY}",
+        ),
+        mlines.Line2D(
+            [],
+            [],
+            color=CLOUD_COVER_COLORS[CLOUD_COVER_MOSTLY],
+            linewidth=WEATHER_LEGEND_LINE_WIDTH,
+            marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_MOSTLY],
+            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_MOSTLY],
+            markeredgecolor="white",
+            markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
+            alpha=WEATHER_OVERLAY_ALPHA,
+            label=f"Weather - {CLOUD_COVER_MOSTLY}",
+        ),
+        mlines.Line2D(
+            [],
+            [],
+            color=CLOUD_COVER_COLORS[CLOUD_COVER_OVERCAST],
+            linewidth=WEATHER_LEGEND_LINE_WIDTH,
+            marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_OVERCAST],
+            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_OVERCAST],
+            markeredgecolor="white",
+            markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
+            alpha=WEATHER_OVERLAY_ALPHA,
+            label=f"Weather - {CLOUD_COVER_OVERCAST}",
+        ),
     ]
     ax.legend(
         handles=legend_patches,
         loc="lower center",
-        bbox_to_anchor=(0.5, -0.15 - (0.04 * max(0, 7 - n_days))),
+        bbox_to_anchor=(0.5, -0.18 - (0.04 * max(0, 7 - n_days))),
         ncol=4,
-        fontsize=9,
+        fontsize=8.5,
         frameon=False,
     )
 

@@ -5,6 +5,7 @@ Monitor and report the status of the UMCI construction camera.
 This project:
 - checks the camera stream on a configurable schedule
 - classifies each sample as `Online - OK`, `Online - Low Power`, `Offline - No Power`, or `Offline - PowerSaving`
+- records cloud-cover observations from NOAA/NWS by station (default: `KDTW`)
 - logs results to CSV
 - generates a 14-day timeline chart
 - can send daily email reports
@@ -38,6 +39,8 @@ Runtime output is written to `./data` on the host:
 - `webcam_stream_diagnostics.csv`
 - `webcam_chart.png`
 - `daily_report_state.json`
+
+`webcam_stream_diagnostics.csv` includes stream diagnostics plus weather/cloud-cover fields.
 
 The included Caddy service exposes `./data` over HTTPS on:
 - `https://localhost:8443/`
@@ -95,6 +98,21 @@ FFMPEG_TIMEOUT_SECONDS=20
 STREAM_CHECK_TIMEOUT_SECONDS=10
 STREAM_CHECK_RETRIES=2
 STREAM_CHECK_RETRY_DELAY_SECONDS=2.0
+NWS_STATION=KDTW
+NWS_API_BASE_URL=https://api.weather.gov
+NWS_REQUEST_TIMEOUT_SECONDS=10
+NWS_USER_AGENT=UMCI Camera Monitor (mikelch@umich.edu)
+WEATHER_OVERLAY_LINE_WIDTH=2.6
+WEATHER_OVERLAY_ICON_SIZE=64.0
+WEATHER_OVERLAY_ICON_EDGE_WIDTH=0.7
+WEATHER_OVERLAY_ALPHA=0.9
+WEATHER_LEGEND_LINE_WIDTH=2.8
+WEATHER_LEGEND_MARKER_SIZE=8.0
+WEATHER_COLOR_CLEAR=#fff200
+WEATHER_COLOR_PARTLY=#2563eb
+WEATHER_COLOR_MOSTLY=#94a3b8
+WEATHER_COLOR_OVERCAST=#475569
+WEATHER_COLOR_UNKNOWN=#d1d5db
 RED_PIXEL_RATIO=0.005
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
@@ -103,6 +121,8 @@ SMTP_PASSWORD=your-app-password
 EMAIL_FROM=youraccount@gmail.com
 EMAIL_TO=recipient@example.com
 SMTP_USE_TLS=true
+SEND_ASCII_CHART_TO_SLACK=false
+WEATHER_SHOW_DURING_POWERSAVING=true
 SLACK_REPORT_NAME=UMCI Camera Monitor
 ```
 
@@ -111,9 +131,19 @@ Tuning notes:
 - `MEASUREMENT_CADENCE_MINUTES` allows only: `15`, `30`, `60`, `120`, `240`, `480`.
 - `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.
 - `STREAM_CHECK_RETRIES` and `STREAM_CHECK_RETRY_DELAY_SECONDS` reduce false `Offline - No Power` events during brief network hiccups.
+- `NWS_STATION` sets the weather station used for cloud cover (`KDTW` is Detroit Metro Airport).
+- The chart draws weather icons at cloud-cover change points, with a colored line centered in each status band showing duration by condition.
+- Weather icon/line sizing and opacity are tunable via `WEATHER_OVERLAY_*` and `WEATHER_LEGEND_*` float variables.
+- Weather colors are tunable via `WEATHER_COLOR_*` hex values.
+- `WEATHER_SHOW_DURING_POWERSAVING=false` hides weather overlays in `Offline - PowerSaving` periods while continuing to log weather each sample.
+- `SEND_ASCII_CHART_TO_SLACK=false` keeps ASCII chart blocks out of Slack/webhook message text by default.
+- Webhook HTML has email-only `cid:` inline images removed to avoid Slack block conversion errors.
 - `NO_POWER_ALERT_THRESHOLD_FRACTION` controls when a no-power alert is sent for the day (default `0.33` means 33% of expected power-on time).
 - `CAMERA_TRANSITION_GRACE_MINUTES` softens classification around dawn/dusk transitions.
 - Invalid env values are logged at startup and safely fall back to defaults.
+
+After changing `.env` values, recreate the monitor container to apply them:
+- `docker compose up -d webcam-monitor`
 
 The daily email includes:
 - summary totals for the most recent completed day
@@ -141,7 +171,7 @@ LAMBDA_WEBHOOK_URL=https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/w
 The nightly webhook report includes:
 - plain-text summary
 - HTML summary
-- ASCII chart block
+- optional ASCII chart block (enabled only when `SEND_ASCII_CHART_TO_SLACK=true`)
 - optional extra fields depending on current development
 
 Manual webhook test:
