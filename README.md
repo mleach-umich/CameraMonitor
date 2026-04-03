@@ -9,7 +9,7 @@ This project:
 - logs results to CSV
 - generates a 14-day timeline chart
 - can send daily email reports
-- can post daily report payloads and alert payloads to a Lambda webhook
+- can post intra-day reports, daily reports, and alert payloads to a Lambda webhook
 
 ## What It Tracks
 
@@ -136,6 +136,7 @@ EMAIL_FROM=youraccount@gmail.com
 EMAIL_TO=recipient@example.com
 SMTP_USE_TLS=true
 SEND_ASCII_CHART_TO_SLACK=false
+INTRADAY_WEBHOOK_REPORT_MINUTES=0
 SLACK_REPORT_NAME=UMCI Camera Monitor
 ```
 
@@ -159,6 +160,7 @@ Tuning notes:
 - `CHART_BACKGROUND_COLOR` controls the chart canvas/background color.
 - `WEATHER_SHOW_DURING_POWERSAVING=false` hides weather overlays in `Offline - PowerSaving` periods while continuing to log weather each sample.
 - `SEND_ASCII_CHART_TO_SLACK=false` keeps ASCII chart blocks out of Slack/webhook message text by default.
+- `INTRADAY_WEBHOOK_REPORT_MINUTES` sends periodic intra-day webhook updates (set `0` to disable).
 - Webhook HTML has email-only `cid:` inline images removed to avoid Slack block conversion errors.
 - `NO_POWER_ALERT_THRESHOLD_FRACTION` controls when a no-power alert is sent for the day (default `0.33` means 33% of expected power-on time).
 - `CAMERA_TRANSITION_GRACE_MINUTES` softens classification around dawn/dusk transitions.
@@ -196,10 +198,16 @@ The nightly webhook report includes:
 - optional ASCII chart block (enabled only when `SEND_ASCII_CHART_TO_SLACK=true`)
 - optional extra fields depending on current development
 
+Intra-day webhook reporting:
+- set `INTRADAY_WEBHOOK_REPORT_MINUTES` to a positive value to send periodic intra-day updates through the same webhook path
+- each message includes an "as-of now" snapshot, latest state sample, and today-to-now accumulated durations
+- set `INTRADAY_WEBHOOK_REPORT_MINUTES=0` to disable periodic intra-day updates
+
 Manual webhook test:
 
 ```powershell
 .\lambdatest.ps1
+docker compose exec -T webcam-monitor python /app/webcam_monitor.py --intradaytest
 ```
 
 ## Power Failure Alerting

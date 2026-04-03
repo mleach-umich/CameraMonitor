@@ -25,6 +25,7 @@ Usage
   python webcam_monitor.py --daily-report     # Send chart + log to Slack
   python webcam_monitor.py --daily-email-report  # Email chart + logs
   python webcam_monitor.py --lambdatest  # Send the nightly webhook report now
+  python webcam_monitor.py --intradaytest  # Send the intra-day webhook report now
   python webcam_monitor.py --alerttest  # Send a no-power alert test
 """
 
@@ -339,6 +340,12 @@ LAMBDA_WEBHOOK_URL = os.environ.get(
     "https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook",
 ).strip()
 SEND_ASCII_CHART_TO_SLACK = get_env_bool("SEND_ASCII_CHART_TO_SLACK", False)
+INTRADAY_WEBHOOK_REPORT_MINUTES = get_env_int(
+    "INTRADAY_WEBHOOK_REPORT_MINUTES",
+    0,
+    min_value=0,
+    max_value=1440,
+)
 WEATHER_SHOW_DURING_POWERSAVING = get_env_bool("WEATHER_SHOW_DURING_POWERSAVING", True)
 NWS_STATION = os.environ.get("NWS_STATION", "KDTW").strip().upper()
 if not NWS_STATION:
@@ -487,6 +494,10 @@ else:
     log.info("Sampling schedule mode: cadence (%d minutes)", MEASUREMENT_CADENCE_MINUTES)
 log.info("NWS weather station: %s", NWS_STATION)
 log.info("Include ASCII chart in Slack/webhook text: %s", SEND_ASCII_CHART_TO_SLACK)
+if INTRADAY_WEBHOOK_REPORT_MINUTES > 0:
+    log.info("Intra-day webhook reports: enabled every %d minutes", INTRADAY_WEBHOOK_REPORT_MINUTES)
+else:
+    log.info("Intra-day webhook reports: disabled")
 log.info("Show weather overlay during power-saving bands: %s", WEATHER_SHOW_DURING_POWERSAVING)
 
 
@@ -1087,6 +1098,108 @@ def format_delta_sentence(label: str, delta_minutes: int) -> tuple[str, str]:
     return plain, html
 
 
+def build_intraday_report_content(now: Optional[datetime] = None) -> dict[str, str]:
+    """Build plain-text and HTML intra-day report content."""
+    if now is None:
+        now = datetime.now()
+
+    entries = read_log()
+    if not entries:
+        plain = f"{SLACK_REPORT_NAME} intra-day report: no log entries found."
+        return {"plain": plain, "html": f"<p>{plain}</p>"}
+
+    report_date = now.date()
+    today_minutes = get_daily_state_minutes(entries, report_date)
+    today_slots = get_day_slot_state_map(entries, report_date)
+    sample_count = len(today_slots)
+
+    latest_dt = None
+    latest_state = None
+    for dt, state in reversed(entries):
+        if dt.date() == report_date:
+            latest_dt = dt
+            latest_state = state
+            break
+
+    if latest_dt is None or latest_state is None:
+        latest_plain = "Latest sample today: no samples captured yet."
+        latest_html = "<em>Latest sample today: no samples captured yet.</em>"
+    else:
+        latest_plain = f"Latest sample today: {latest_dt:%H:%M:%S} - {latest_state}"
+        latest_html = (
+            f"<strong>Latest sample today:</strong> {latest_dt:%H:%M:%S} - "
+            f"{html.escape(latest_state)}"
+        )
+
+    expected_power_minutes = get_expected_power_on_minutes(report_date)
+    alert_threshold_minutes = get_no_power_alert_threshold_minutes(report_date)
+    no_power_minutes = today_minutes[STATE_OFFLINE_NOPOWER]
+
+    if alert_threshold_minutes > 0:
+        threshold_pct = (no_power_minutes / alert_threshold_minutes) * 100.0
+        no_power_progress_plain = (
+            f"No-power alert progress: {format_minutes_as_hours(no_power_minutes)} of "
+            f"{format_minutes_as_hours(alert_threshold_minutes)} threshold "
+            f"({threshold_pct:.1f}% of threshold)."
+        )
+    else:
+        no_power_progress_plain = (
+            f"No-power alert progress: {format_minutes_as_hours(no_power_minutes)} "
+            "(threshold unavailable)."
+        )
+
+    coverage_plain = f"Coverage window: 00:00 to {now:%H:%M:%S} local time."
+    cadence_plain = (
+        f"Configured intra-day cadence: every {INTRADAY_WEBHOOK_REPORT_MINUTES} minutes."
+        if INTRADAY_WEBHOOK_REPORT_MINUTES > 0
+        else "Configured intra-day cadence: disabled."
+    )
+    expected_plain = (
+        f"Expected daylight power-on target: {format_minutes_as_hours(expected_power_minutes)}."
+        if expected_power_minutes > 0
+        else "Expected daylight power-on target: not available."
+    )
+
+    plain = (
+        f"{SLACK_REPORT_NAME} intra-day report for {report_date:%Y-%m-%d} "
+        f"(as of {now:%H:%M:%S})\n\n"
+        f"{coverage_plain}\n"
+        f"{cadence_plain}\n"
+        f"{latest_plain}\n"
+        f"Samples today: {sample_count}\n\n"
+        f"Accumulated today\n"
+        f"OK\t-\t{format_minutes_as_hours(today_minutes[STATE_ONLINE_OK])}\n"
+        f"Power Saver\t-\t{format_minutes_as_hours(today_minutes[STATE_OFFLINE_SAVING])}\n"
+        f"Low Power\t-\t{format_minutes_as_hours(today_minutes[STATE_ONLINE_LOWPOWER])}\n"
+        f"No Power\t-\t{format_minutes_as_hours(today_minutes[STATE_OFFLINE_NOPOWER])}\n\n"
+        f"{expected_plain}\n"
+        f"{no_power_progress_plain}"
+    )
+
+    html_body = f"""
+<html>
+  <body style="font-family: Arial, sans-serif; color: #222;">
+    <h2 style="margin-bottom: 8px;">{SLACK_REPORT_NAME} intra-day report for {report_date:%Y-%m-%d}</h2>
+    <p style="margin: 0 0 8px 0;"><strong>As of:</strong> {now:%H:%M:%S} local time</p>
+    <p style="margin: 0 0 8px 0;">{html.escape(cadence_plain)}</p>
+    <p style="margin: 0 0 8px 0;">{latest_html}</p>
+    <p style="margin: 0 0 16px 0;"><strong>Samples today:</strong> {sample_count}</p>
+    <table style="border-collapse: collapse; margin-bottom: 16px;">
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">OK</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_ONLINE_OK])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Power Saver</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_OFFLINE_SAVING])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Low Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_ONLINE_LOWPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_OFFLINE_NOPOWER])}</td></tr>
+    </table>
+    <p style="margin: 0 0 8px 0;">{html.escape(expected_plain)}</p>
+    <p style="margin: 0 0 16px 0;">{html.escape(no_power_progress_plain)}</p>
+    <img src="cid:webcam_chart_inline" alt="Webcam status chart" style="max-width: 100%; height: auto; border: 1px solid #ddd;" />
+  </body>
+</html>
+""".strip()
+
+    return {"plain": plain, "html": html_body}
+
+
 def build_daily_report_content(target_date=None) -> dict[str, str]:
     """Build plain-text and HTML daily report content."""
     entries = read_log()
@@ -1492,9 +1605,72 @@ def send_daily_webhook_report(report_date=None) -> None:
     post_lambda_webhook(payload)
 
 
+def send_intraday_webhook_report(now: Optional[datetime] = None) -> None:
+    """Send an intra-day status update payload to the Lambda webhook."""
+    if now is None:
+        now = datetime.now()
+
+    if not CHART_FILE.exists():
+        generate_chart(days=DEFAULT_CHART_DAYS)
+
+    report_content = build_intraday_report_content(now=now)
+    chart_ascii = build_chart_ascii() if SEND_ASCII_CHART_TO_SLACK else None
+    text_body = report_content["plain"]
+    html_body = sanitize_webhook_html(report_content["html"])
+
+    if chart_ascii and SEND_ASCII_CHART_TO_SLACK:
+        text_body = f"{text_body}\n\nASCII chart\n```\n{chart_ascii}\n```"
+        html_body = html_body.replace(
+            "</body>",
+            f'<h3 style="margin: 16px 0 8px 0;">ASCII chart</h3>'
+            f'<pre style="font-family: Courier New, monospace; font-size: 10px; line-height: 1.1; '
+            f'background: #f7f7f7; border: 1px solid #ddd; padding: 8px; white-space: pre-wrap;">'
+            f'{html.escape(chart_ascii)}</pre></body>',
+        )
+
+    payload = {
+        "source": SLACK_REPORT_NAME,
+        "event": "intraday_report",
+        "report_date": now.date().isoformat(),
+        "report_timestamp_local": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "intraday_cadence_minutes": INTRADAY_WEBHOOK_REPORT_MINUTES,
+        "text": text_body,
+        "html": html_body,
+        "chart_image_base64_png": build_chart_base64(),
+    }
+    if chart_ascii and SEND_ASCII_CHART_TO_SLACK:
+        payload["chart_ascii_art"] = chart_ascii
+    post_lambda_webhook(payload)
+
+
 def send_lambdatest() -> None:
     """Send the nightly Lambda webhook report payload on demand."""
     send_daily_webhook_report()
+
+
+def send_intradaytest() -> None:
+    """Send an intra-day Lambda webhook report payload on demand."""
+    send_intraday_webhook_report(now=datetime.now())
+
+
+def maybe_send_intraday_webhook_report(now: datetime) -> None:
+    """Send intra-day webhook status updates on the configured cadence."""
+    if not LAMBDA_WEBHOOK_URL:
+        return
+    if INTRADAY_WEBHOOK_REPORT_MINUTES <= 0:
+        return
+
+    minute_of_day = get_minute_of_day(now)
+    interval_start = (minute_of_day // INTRADAY_WEBHOOK_REPORT_MINUTES) * INTRADAY_WEBHOOK_REPORT_MINUTES
+    slot_key = f"{now.date().isoformat()}:{interval_start:04d}:{INTRADAY_WEBHOOK_REPORT_MINUTES}"
+
+    state = read_report_state()
+    if state.get("last_intraday_report_slot") == slot_key:
+        return
+
+    send_intraday_webhook_report(now=now)
+    state["last_intraday_report_slot"] = slot_key
+    write_report_state(state)
 
 
 def maybe_send_no_power_alert(now: datetime) -> None:
@@ -1544,18 +1720,15 @@ def get_next_scheduled_check(after: Optional[datetime] = None) -> datetime:
 
 def read_last_reported_date() -> Optional[str]:
     """Read the last date for which a daily email report was sent."""
-    if not REPORT_STATE_FILE.exists():
-        return None
-    try:
-        data = json.loads(REPORT_STATE_FILE.read_text())
-        return data.get("last_report_date")
-    except Exception:
-        return None
+    state = read_report_state()
+    return state.get("last_report_date")
 
 
 def write_last_reported_date(report_date: str) -> None:
     """Persist the last date for which a daily email report was sent."""
-    REPORT_STATE_FILE.write_text(json.dumps({"last_report_date": report_date}))
+    state = read_report_state()
+    state["last_report_date"] = report_date
+    write_report_state(state)
 
 
 def maybe_send_end_of_day_report(now: datetime) -> None:
@@ -1834,6 +2007,7 @@ def run_once(now: Optional[datetime] = None) -> str:
     append_diagnostics_log(now, state, diagnostics)
     log.info("State: %s", state)
     generate_chart(days=DEFAULT_CHART_DAYS)
+    maybe_send_intraday_webhook_report(now)
     maybe_send_no_power_alert(now)
     maybe_send_end_of_day_report(now)
     return state
@@ -1897,6 +2071,11 @@ def main() -> None:
         help="Send the nightly Lambda webhook report payload now.",
     )
     parser.add_argument(
+        "--intradaytest",
+        action="store_true",
+        help="Send the intra-day Lambda webhook report payload now.",
+    )
+    parser.add_argument(
         "--alerttest",
         action="store_true",
         help="Send a no-power alert test message now.",
@@ -1911,6 +2090,8 @@ def main() -> None:
         send_daily_email_report(days=args.daily_email_report)
     elif args.lambdatest:
         send_lambdatest()
+    elif args.intradaytest:
+        send_intradaytest()
     elif args.alerttest:
         send_alerttest()
     elif args.loop:
@@ -1921,5 +2102,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
