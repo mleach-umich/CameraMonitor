@@ -221,6 +221,30 @@ def minute_to_hhmm(minute_of_day: int) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def format_chart_date_label(date_value) -> str:
+    """Format a chart Y-axis date label using configured style."""
+    if CHART_Y_DATE_FORMAT == "iso":
+        return date_value.strftime("%Y-%m-%d")
+    if CHART_Y_DATE_FORMAT == "mdy_zero":
+        return date_value.strftime("%m/%d/%Y")
+    if CHART_Y_DATE_FORMAT == "dmy":
+        return f"{date_value.day}/{date_value.month}/{date_value.year}"
+    return f"{date_value.month}/{date_value.day}/{date_value.year}"
+
+
+def build_hour_labels() -> list[str]:
+    """Return chart X-axis labels in 12-hour or 24-hour format."""
+    if CHART_X_TIME_FORMAT == "24":
+        return [f"{h:02d}:00" for h in range(25)]
+    labels: list[str] = []
+    for h in range(25):
+        hour_24 = h % 24
+        suffix = "AM" if hour_24 < 12 else "PM"
+        hour_12 = hour_24 % 12 or 12
+        labels.append(f"{hour_12} {suffix}")
+    return labels
+
+
 def compute_schedule_slot_starts(mode: str, cadence_minutes: int, fixed_times_minutes: list[int]) -> list[int]:
     """Return slot starts (minutes since midnight) for one day."""
     if mode == "fixed":
@@ -344,12 +368,34 @@ WEATHER_OVERLAY_ICON_EDGE_WIDTH = get_env_float(
 )
 WEATHER_OVERLAY_ALPHA = get_env_float("WEATHER_OVERLAY_ALPHA", 0.9, min_value=0.0, max_value=1.0)
 WEATHER_LEGEND_LINE_WIDTH = get_env_float("WEATHER_LEGEND_LINE_WIDTH", 2.8, min_value=0.2, max_value=12.0)
-WEATHER_LEGEND_MARKER_SIZE = get_env_float("WEATHER_LEGEND_MARKER_SIZE", 8.0, min_value=2.0, max_value=24.0)
+_legacy_weather_legend_marker_size = get_env_float("WEATHER_LEGEND_MARKER_SIZE", 8.0, min_value=2.0, max_value=24.0)
+CHART_LEGEND_FONT_SIZE = get_env_float("CHART_LEGEND_FONT_SIZE", 8.5, min_value=5.0, max_value=24.0)
+CHART_LEGEND_SYMBOL_SIZE = get_env_float(
+    "CHART_LEGEND_SYMBOL_SIZE",
+    _legacy_weather_legend_marker_size,
+    min_value=2.0,
+    max_value=36.0,
+)
 WEATHER_COLOR_CLEAR = get_env_hex_color("WEATHER_COLOR_CLEAR", "#fff200")
 WEATHER_COLOR_PARTLY = get_env_hex_color("WEATHER_COLOR_PARTLY", "#2563eb")
 WEATHER_COLOR_MOSTLY = get_env_hex_color("WEATHER_COLOR_MOSTLY", "#94a3b8")
 WEATHER_COLOR_OVERCAST = get_env_hex_color("WEATHER_COLOR_OVERCAST", "#475569")
 WEATHER_COLOR_UNKNOWN = get_env_hex_color("WEATHER_COLOR_UNKNOWN", "#d1d5db")
+CHART_BACKGROUND_COLOR = get_env_hex_color("CHART_BACKGROUND_COLOR", "#ffffff")
+STATE_COLOR_ONLINE_OK = get_env_hex_color("STATE_COLOR_ONLINE_OK", "#22c55e")
+STATE_COLOR_ONLINE_LOWPOWER = get_env_hex_color("STATE_COLOR_ONLINE_LOWPOWER", "#eab308")
+STATE_COLOR_OFFLINE_NOPOWER = get_env_hex_color("STATE_COLOR_OFFLINE_NOPOWER", "#ef4444")
+STATE_COLOR_OFFLINE_SAVING = get_env_hex_color("STATE_COLOR_OFFLINE_SAVING", "#c0c0c0")
+CHART_TEXT_COLOR = get_env_hex_color("CHART_TEXT_COLOR", "#111827")
+CHART_TITLE_COLOR = get_env_hex_color("CHART_TITLE_COLOR", "#111827")
+CHART_TITLE_FONT_SIZE = get_env_float("CHART_TITLE_FONT_SIZE", 13.0, min_value=6.0, max_value=48.0)
+CHART_TITLE_TEXT = os.environ.get("CHART_TITLE_TEXT", "UMCI - Construction CAM Status").strip()
+if not CHART_TITLE_TEXT:
+    add_config_warning("CHART_TITLE_TEXT is empty; using default title text.")
+    CHART_TITLE_TEXT = "UMCI - Construction CAM Status"
+CHART_VERTICAL_LINE_COLOR = get_env_hex_color("CHART_VERTICAL_LINE_COLOR", "#e0e0e0")
+CHART_X_TIME_FORMAT = get_env_choice("CHART_X_TIME_FORMAT", "12", {"12", "24"})
+CHART_Y_DATE_FORMAT = get_env_choice("CHART_Y_DATE_FORMAT", "mdy", {"mdy", "mdy_zero", "dmy", "iso"})
 
 # Detection thresholds for "low power" red text
 # We look at the top-left overlay region of the captured frame
@@ -366,10 +412,10 @@ STATE_OFFLINE_NOPOWER = "Offline - No Power"
 STATE_OFFLINE_SAVING  = "Offline - PowerSaving"
 
 STATE_COLORS = {
-    STATE_ONLINE_OK:       "#22c55e",  # green
-    STATE_ONLINE_LOWPOWER: "#eab308",  # yellow
-    STATE_OFFLINE_NOPOWER: "#ef4444",  # red
-    STATE_OFFLINE_SAVING:  "#c0c0c0",  # gray
+    STATE_ONLINE_OK:       STATE_COLOR_ONLINE_OK,
+    STATE_ONLINE_LOWPOWER: STATE_COLOR_ONLINE_LOWPOWER,
+    STATE_OFFLINE_NOPOWER: STATE_COLOR_OFFLINE_NOPOWER,
+    STATE_OFFLINE_SAVING:  STATE_COLOR_OFFLINE_SAVING,
 }
 
 # Weather cloud-cover categories
@@ -1558,6 +1604,8 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
     n_days = len(dates)
     fig_height = max(3.6, 0.7 * n_days + 1.8)
     fig, ax = plt.subplots(figsize=(16, fig_height))
+    fig.patch.set_facecolor(CHART_BACKGROUND_COLOR)
+    ax.set_facecolor(CHART_BACKGROUND_COLOR)
 
     band_height = 0.78
     divider_linewidth = 0.8
@@ -1625,7 +1673,7 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                 divider, = ax.plot(
                     [segment_end, segment_end],
                     [divider_ymin, divider_ymax],
-                    color="black",
+                    color=CHART_VERTICAL_LINE_COLOR,
                     linewidth=divider_linewidth,
                     solid_capstyle="butt",
                     zorder=3,
@@ -1664,31 +1712,28 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
                     s=WEATHER_OVERLAY_ICON_SIZE,
                     marker=marker,
                     c=[weather_color],
-                    edgecolors="white",
+                    edgecolors=[weather_color],
                     linewidths=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
                     zorder=6,
                     alpha=WEATHER_OVERLAY_ALPHA,
                 )
 
     # Y-axis: date labels
-    y_labels = [d.strftime("%-m/%-d/%Y") for d in reversed(dates)]
+    y_labels = [format_chart_date_label(d) for d in reversed(dates)]
     ax.set_yticks(range(n_days))
-    ax.set_yticklabels(y_labels, fontsize=9)
+    ax.set_yticklabels(y_labels, fontsize=9, color=CHART_TEXT_COLOR)
     ax.set_ylim(-0.55, n_days - 0.45)
 
     # X-axis: hours
     hour_ticks = list(range(0, 25 * 60, 60))
-    hour_labels = [
-        f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}" if h <= 24 else ""
-        for h in range(25)
-    ]
+    hour_labels = build_hour_labels()
     ax.set_xticks(hour_ticks)
-    ax.set_xticklabels(hour_labels, fontsize=7.5, rotation=0)
+    ax.set_xticklabels(hour_labels, fontsize=7.5, rotation=0, color=CHART_TEXT_COLOR)
     ax.set_xlim(0, 24 * 60)
 
     # Grid and styling
     ax.set_axisbelow(True)
-    ax.grid(axis="x", color="#e0e0e0", linewidth=0.5)
+    ax.grid(axis="x", color=CHART_VERTICAL_LINE_COLOR, linewidth=0.5)
     ax.tick_params(axis="both", which="both", length=0)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -1707,9 +1752,9 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
             color=CLOUD_COVER_COLORS[CLOUD_COVER_CLEAR],
             linewidth=WEATHER_LEGEND_LINE_WIDTH,
             marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_CLEAR],
-            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markersize=CHART_LEGEND_SYMBOL_SIZE,
             markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_CLEAR],
-            markeredgecolor="white",
+            markeredgecolor=CLOUD_COVER_COLORS[CLOUD_COVER_CLEAR],
             markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
             alpha=WEATHER_OVERLAY_ALPHA,
             label=f"Weather - {CLOUD_COVER_CLEAR}",
@@ -1720,9 +1765,9 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
             color=CLOUD_COVER_COLORS[CLOUD_COVER_PARTLY],
             linewidth=WEATHER_LEGEND_LINE_WIDTH,
             marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_PARTLY],
-            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markersize=CHART_LEGEND_SYMBOL_SIZE,
             markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_PARTLY],
-            markeredgecolor="white",
+            markeredgecolor=CLOUD_COVER_COLORS[CLOUD_COVER_PARTLY],
             markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
             alpha=WEATHER_OVERLAY_ALPHA,
             label=f"Weather - {CLOUD_COVER_PARTLY}",
@@ -1733,9 +1778,9 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
             color=CLOUD_COVER_COLORS[CLOUD_COVER_MOSTLY],
             linewidth=WEATHER_LEGEND_LINE_WIDTH,
             marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_MOSTLY],
-            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markersize=CHART_LEGEND_SYMBOL_SIZE,
             markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_MOSTLY],
-            markeredgecolor="white",
+            markeredgecolor=CLOUD_COVER_COLORS[CLOUD_COVER_MOSTLY],
             markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
             alpha=WEATHER_OVERLAY_ALPHA,
             label=f"Weather - {CLOUD_COVER_MOSTLY}",
@@ -1746,32 +1791,35 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
             color=CLOUD_COVER_COLORS[CLOUD_COVER_OVERCAST],
             linewidth=WEATHER_LEGEND_LINE_WIDTH,
             marker=CLOUD_COVER_ICON_MARKERS[CLOUD_COVER_OVERCAST],
-            markersize=WEATHER_LEGEND_MARKER_SIZE,
+            markersize=CHART_LEGEND_SYMBOL_SIZE,
             markerfacecolor=CLOUD_COVER_COLORS[CLOUD_COVER_OVERCAST],
-            markeredgecolor="white",
+            markeredgecolor=CLOUD_COVER_COLORS[CLOUD_COVER_OVERCAST],
             markeredgewidth=WEATHER_OVERLAY_ICON_EDGE_WIDTH,
             alpha=WEATHER_OVERLAY_ALPHA,
             label=f"Weather - {CLOUD_COVER_OVERCAST}",
         ),
     ]
-    ax.legend(
+    legend = ax.legend(
         handles=legend_patches,
         loc="lower center",
         bbox_to_anchor=(0.5, -0.18 - (0.04 * max(0, 7 - n_days))),
         ncol=4,
-        fontsize=8.5,
+        fontsize=CHART_LEGEND_FONT_SIZE,
         frameon=False,
     )
+    for text in legend.get_texts():
+        text.set_color(CHART_TEXT_COLOR)
 
     ax.set_title(
-        "UMCI - Construction CAM Status",
-        fontsize=13,
+        CHART_TITLE_TEXT,
+        fontsize=CHART_TITLE_FONT_SIZE,
         fontweight="bold",
+        color=CHART_TITLE_COLOR,
         pad=12,
     )
 
     fig.tight_layout()
-    fig.savefig(CHART_FILE, dpi=150, bbox_inches="tight", facecolor="white")
+    fig.savefig(CHART_FILE, dpi=150, bbox_inches="tight", facecolor=CHART_BACKGROUND_COLOR)
     plt.close(fig)
     log.info("Chart saved to %s", CHART_FILE)
 

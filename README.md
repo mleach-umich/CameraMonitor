@@ -102,12 +102,26 @@ NWS_STATION=KDTW
 NWS_API_BASE_URL=https://api.weather.gov
 NWS_REQUEST_TIMEOUT_SECONDS=10
 NWS_USER_AGENT=UMCI Camera Monitor (mikelch@umich.edu)
+STATE_COLOR_ONLINE_OK=#22c55e
+STATE_COLOR_ONLINE_LOWPOWER=#eab308
+STATE_COLOR_OFFLINE_NOPOWER=#ef4444
+STATE_COLOR_OFFLINE_SAVING=#c0c0c0
+CHART_TEXT_COLOR=#111827
+CHART_TITLE_COLOR=#111827
+CHART_TITLE_FONT_SIZE=13.0
+CHART_TITLE_TEXT=UMCI - Construction CAM Status
+CHART_VERTICAL_LINE_COLOR=#e0e0e0
+CHART_X_TIME_FORMAT=12
+CHART_Y_DATE_FORMAT=mdy
+CHART_BACKGROUND_COLOR=#ffffff
+WEATHER_SHOW_DURING_POWERSAVING=true
 WEATHER_OVERLAY_LINE_WIDTH=2.6
 WEATHER_OVERLAY_ICON_SIZE=64.0
 WEATHER_OVERLAY_ICON_EDGE_WIDTH=0.7
 WEATHER_OVERLAY_ALPHA=0.9
 WEATHER_LEGEND_LINE_WIDTH=2.8
-WEATHER_LEGEND_MARKER_SIZE=8.0
+CHART_LEGEND_FONT_SIZE=8.5
+CHART_LEGEND_SYMBOL_SIZE=8.0
 WEATHER_COLOR_CLEAR=#fff200
 WEATHER_COLOR_PARTLY=#2563eb
 WEATHER_COLOR_MOSTLY=#94a3b8
@@ -122,7 +136,6 @@ EMAIL_FROM=youraccount@gmail.com
 EMAIL_TO=recipient@example.com
 SMTP_USE_TLS=true
 SEND_ASCII_CHART_TO_SLACK=false
-WEATHER_SHOW_DURING_POWERSAVING=true
 SLACK_REPORT_NAME=UMCI Camera Monitor
 ```
 
@@ -132,9 +145,18 @@ Tuning notes:
 - `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.
 - `STREAM_CHECK_RETRIES` and `STREAM_CHECK_RETRY_DELAY_SECONDS` reduce false `Offline - No Power` events during brief network hiccups.
 - `NWS_STATION` sets the weather station used for cloud cover (`KDTW` is Detroit Metro Airport).
+- `STATE_COLOR_*` variables control the four status band colors for online/offline conditions.
 - The chart draws weather icons at cloud-cover change points, with a colored line centered in each status band showing duration by condition.
+- `CHART_TEXT_COLOR` applies to x/y tick labels and legend text.
+- `CHART_TITLE_TEXT`, `CHART_TITLE_COLOR`, and `CHART_TITLE_FONT_SIZE` control the chart title.
+- `CHART_VERTICAL_LINE_COLOR` sets both hourly grid lines and in-band slot divider lines.
+- `CHART_X_TIME_FORMAT` supports `12` or `24` hour labels on the x-axis.
+- `CHART_Y_DATE_FORMAT` supports `mdy`, `mdy_zero`, `dmy`, or `iso` labels on the y-axis.
 - Weather icon/line sizing and opacity are tunable via `WEATHER_OVERLAY_*` and `WEATHER_LEGEND_*` float variables.
+- `CHART_LEGEND_FONT_SIZE` and `CHART_LEGEND_SYMBOL_SIZE` tune legend text and weather symbol size.
+- `WEATHER_LEGEND_MARKER_SIZE` is still accepted as a legacy alias for `CHART_LEGEND_SYMBOL_SIZE`.
 - Weather colors are tunable via `WEATHER_COLOR_*` hex values.
+- `CHART_BACKGROUND_COLOR` controls the chart canvas/background color.
 - `WEATHER_SHOW_DURING_POWERSAVING=false` hides weather overlays in `Offline - PowerSaving` periods while continuing to log weather each sample.
 - `SEND_ASCII_CHART_TO_SLACK=false` keeps ASCII chart blocks out of Slack/webhook message text by default.
 - Webhook HTML has email-only `cid:` inline images removed to avoid Slack block conversion errors.
