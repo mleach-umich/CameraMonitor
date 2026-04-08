@@ -3,10 +3,10 @@ services:
     build: .
     container_name: webcam-monitor
     restart: unless-stopped
-    user: "${LOCAL_UID:-0}:${LOCAL_GID:-0}"
+    user: "${LOCAL_UID:-1002}:${LOCAL_GID:-1002}"
     volumes:
       # Log and chart files persist here on the host
-      - ${HOST_DATA_DIR:-./data}:/data
+      - ${HOST_DATA_DIR:-/home/mikelch/camera-data}:/data
     env_file:
       - path: .env.shared
         required: false
@@ -24,7 +24,7 @@ services:
     ports:
       - "8443:8443"
     volumes:
-      - ${HOST_DATA_DIR:-./data}:/srv:ro
+      - ${HOST_DATA_DIR:-/home/mikelch/camera-data}:/srv:ro
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
