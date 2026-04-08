@@ -34,7 +34,7 @@ To avoid false red/no-power reports around startup and shutdown behavior, the co
 
 ## Data Output
 
-Runtime output is written to `./data` on the host:
+Runtime output is written to `./data` on the host by default (override with `HOST_DATA_DIR`):
 - `webcam_log.csv`
 - `webcam_stream_diagnostics.csv`
 - `webcam_chart.png`
@@ -42,7 +42,7 @@ Runtime output is written to `./data` on the host:
 
 `webcam_stream_diagnostics.csv` includes stream diagnostics plus weather/cloud-cover fields.
 
-The included Caddy service exposes `./data` over HTTPS on:
+The included Caddy service exposes the host data directory over HTTPS on:
 - `https://localhost:8443/`
 
 ## Running With Docker
@@ -65,6 +65,12 @@ Regenerate the chart manually:
 docker compose exec -T webcam-monitor python /app/webcam_monitor.py --chart 14
 ```
 
+Config workflow for laptop + VM:
+1. Commit non-sensitive config changes in `.env.shared`.
+2. Keep secrets only in local `.env.secret` on each machine.
+3. Push PR/merge to GitHub, then run `git pull` on the VM.
+4. Restart with `docker compose up -d --build` (or `docker compose up -d webcam-monitor` for env-only changes).
+
 ## Monitor Behavior
 
 When the container starts in loop mode, it:
@@ -81,13 +87,15 @@ Scheduling modes:
 
 The monitor supports SMTP-based daily reporting.
 
-Relevant environment variables:
+Configuration files:
+- [.env.shared](.env.shared): tracked non-sensitive runtime config (safe to update in PRs)
+- `.env.secret`: local-only sensitive values (not committed)
+- [.env.secret.example](.env.secret.example): template for `.env.secret`
+- [.env.example](.env.example): optional host-level Docker Compose overrides (`HOST_DATA_DIR`, `TZ`, etc.)
+
+Shared runtime config (`.env.shared`, non-sensitive):
 
 ```env
-STREAM_URL=https://558312d54930d.streamlock.net/live/umci.fois.axis.stream/playlist.m3u8
-CAMERA_LATITUDE=42.325
-CAMERA_LONGITUDE=-83.05
-CAMERA_TIMEZONE=America/New_York
 MEASUREMENT_SCHEDULE_MODE=cadence
 MEASUREMENT_CADENCE_MINUTES=15
 MEASUREMENT_FIXED_TIMES=
@@ -128,19 +136,35 @@ WEATHER_COLOR_MOSTLY=#94a3b8
 WEATHER_COLOR_OVERCAST=#475569
 WEATHER_COLOR_UNKNOWN=#d1d5db
 RED_PIXEL_RATIO=0.005
+```
+
+Sensitive config (`.env.secret`, local only):
+
+```env
+STREAM_URL=https://558312d54930d.streamlock.net/live/umci.fois.axis.stream/playlist.m3u8
+CAMERA_LATITUDE=42.325
+CAMERA_LONGITUDE=-83.05
+CAMERA_TIMEZONE=America/New_York
+
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_CHANNEL_ID=C0123456789
+SLACK_REPORT_NAME=UMCI Camera Monitor
+SEND_ASCII_CHART_TO_SLACK=false
+INTRADAY_WEBHOOK_REPORT_MINUTES=0
+
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
+SMTP_USE_TLS=true
 SMTP_USERNAME=youraccount@gmail.com
 SMTP_PASSWORD=your-app-password
 EMAIL_FROM=youraccount@gmail.com
 EMAIL_TO=recipient@example.com
-SMTP_USE_TLS=true
-SEND_ASCII_CHART_TO_SLACK=false
-INTRADAY_WEBHOOK_REPORT_MINUTES=0
-SLACK_REPORT_NAME=UMCI Camera Monitor
+
+LAMBDA_WEBHOOK_URL=https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook
 ```
 
 Tuning notes:
+- Stream URL/site location and email/webhook transport settings are intentionally stored in `.env.secret`.
 - `MEASUREMENT_SCHEDULE_MODE` supports `cadence` or `fixed`.
 - `MEASUREMENT_CADENCE_MINUTES` allows only: `15`, `30`, `60`, `120`, `240`, `480`.
 - `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.
@@ -166,7 +190,7 @@ Tuning notes:
 - `CAMERA_TRANSITION_GRACE_MINUTES` softens classification around dawn/dusk transitions.
 - Invalid env values are logged at startup and safely fall back to defaults.
 
-After changing `.env` values, recreate the monitor container to apply them:
+After changing `.env.shared` or `.env.secret` values, recreate the monitor container to apply them:
 - `docker compose up -d webcam-monitor`
 
 The daily email includes:
@@ -186,7 +210,7 @@ docker compose exec -T webcam-monitor python /app/webcam_monitor.py --daily-emai
 
 The monitor can POST JSON payloads to a Lambda-backed webhook.
 
-Environment variable:
+Sensitive environment variable (set in `.env.secret`):
 
 ```env
 LAMBDA_WEBHOOK_URL=https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook
@@ -230,10 +254,14 @@ Manual alert test:
 
 The public repo excludes:
 - `.env`
+- `.env.secret`
 - `data/`
 - `__pycache__/`
 
-Use [.env.example](.env.example) as the template for local configuration.
+Use these templates:
+- [.env.shared](.env.shared) for tracked non-sensitive runtime configuration
+- [.env.secret.example](.env.secret.example) to create local `.env.secret`
+- [.env.example](.env.example) for optional host-level Docker Compose overrides
 
 ## Notes
 
