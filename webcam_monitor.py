@@ -38,6 +38,7 @@ import html
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -319,6 +320,13 @@ if not SCHEDULE_SLOT_STARTS or not SCHEDULE_CHECK_MINUTES:
 CHECK_TARGET_SECOND = get_env_int("CHECK_TARGET_SECOND", 50, min_value=0, max_value=59)
 DEFAULT_CHART_DAYS = 14
 CAMERA_TRANSITION_GRACE_MINUTES = get_env_int("CAMERA_TRANSITION_GRACE_MINUTES", 15, min_value=0)
+CHECK_COMPLETE_BY_SLOT_END = get_env_bool("CHECK_COMPLETE_BY_SLOT_END", True)
+CHECK_COMPLETION_BUFFER_SECONDS = get_env_float(
+    "CHECK_COMPLETION_BUFFER_SECONDS",
+    2.0,
+    min_value=0.0,
+    max_value=59.0,
+)
 NO_POWER_ALERT_THRESHOLD_FRACTION = get_env_float(
     "NO_POWER_ALERT_THRESHOLD_FRACTION",
     0.33,
@@ -360,7 +368,7 @@ if not NWS_API_BASE_URL:
 FFMPEG_TIMEOUT = get_env_int("FFMPEG_TIMEOUT_SECONDS", 20, min_value=1)
 STREAM_CHECK_TIMEOUT_SECONDS = get_env_int("STREAM_CHECK_TIMEOUT_SECONDS", 10, min_value=1)
 STREAM_CHECK_RETRIES = get_env_int("STREAM_CHECK_RETRIES", 2, min_value=0)
-STREAM_CHECK_RETRY_DELAY_SECONDS = get_env_float("STREAM_CHECK_RETRY_DELAY_SECONDS", 2.0, min_value=0.0)
+STREAM_CHECK_RETRY_DELAY_SECONDS = get_env_float("STREAM_CHECK_RETRY_DELAY_SECONDS", 4.0, min_value=0.0)
 NWS_REQUEST_TIMEOUT_SECONDS = get_env_int("NWS_REQUEST_TIMEOUT_SECONDS", 10, min_value=1)
 NWS_USER_AGENT = os.environ.get("NWS_USER_AGENT", "").strip() or (
     f"{SLACK_REPORT_NAME}/1.0 ({EMAIL_FROM or 'webcam-monitor@local'})"
@@ -393,6 +401,8 @@ STATE_COLOR_ONLINE_OK = get_env_hex_color("STATE_COLOR_ONLINE_OK", "#22c55e")
 STATE_COLOR_ONLINE_LOWPOWER = get_env_hex_color("STATE_COLOR_ONLINE_LOWPOWER", "#eab308")
 STATE_COLOR_OFFLINE_NOPOWER = get_env_hex_color("STATE_COLOR_OFFLINE_NOPOWER", "#ef4444")
 STATE_COLOR_OFFLINE_SAVING = get_env_hex_color("STATE_COLOR_OFFLINE_SAVING", "#c0c0c0")
+STATE_COLOR_SUSPECT_NOPOWER = get_env_hex_color("STATE_COLOR_SUSPECT_NOPOWER", "#000000")
+STATE_COLOR_FETCH_ERROR = get_env_hex_color("STATE_COLOR_FETCH_ERROR", "#000000")
 CHART_TEXT_COLOR = get_env_hex_color("CHART_TEXT_COLOR", "#111827")
 CHART_TITLE_COLOR = get_env_hex_color("CHART_TITLE_COLOR", "#111827")
 CHART_TITLE_FONT_SIZE = get_env_float("CHART_TITLE_FONT_SIZE", 13.0, min_value=6.0, max_value=48.0)
@@ -403,6 +413,17 @@ if not CHART_TITLE_TEXT:
 CHART_VERTICAL_LINE_COLOR = get_env_hex_color("CHART_VERTICAL_LINE_COLOR", "#e0e0e0")
 CHART_X_TIME_FORMAT = get_env_choice("CHART_X_TIME_FORMAT", "12", {"12", "24"})
 CHART_Y_DATE_FORMAT = get_env_choice("CHART_Y_DATE_FORMAT", "mdy", {"mdy", "mdy_zero", "dmy", "iso"})
+
+_estimated_stream_retry_budget_seconds = (
+    (STREAM_CHECK_RETRIES + 1) * STREAM_CHECK_TIMEOUT_SECONDS
+    + (STREAM_CHECK_RETRIES * STREAM_CHECK_RETRY_DELAY_SECONDS)
+)
+_estimated_check_worst_case_seconds = _estimated_stream_retry_budget_seconds + FFMPEG_TIMEOUT
+if CHECK_COMPLETE_BY_SLOT_END:
+    _latest_safe_second = 60 - int(math.ceil(_estimated_check_worst_case_seconds + CHECK_COMPLETION_BUFFER_SECONDS))
+    EFFECTIVE_CHECK_TARGET_SECOND = max(0, min(59, min(CHECK_TARGET_SECOND, _latest_safe_second)))
+else:
+    EFFECTIVE_CHECK_TARGET_SECOND = CHECK_TARGET_SECOND
 
 # Detection thresholds for "low power" red text
 # We look at the top-left overlay region of the captured frame
@@ -417,12 +438,16 @@ STATE_ONLINE_OK       = "Online - OK"
 STATE_ONLINE_LOWPOWER = "Online - Low Power"
 STATE_OFFLINE_NOPOWER = "Offline - No Power"
 STATE_OFFLINE_SAVING  = "Offline - PowerSaving"
+STATE_SUSPECT_NOPOWER = "Suspect - No Power"
+STATE_FETCH_ERROR = "Fetch Error"
 
 STATE_COLORS = {
     STATE_ONLINE_OK:       STATE_COLOR_ONLINE_OK,
     STATE_ONLINE_LOWPOWER: STATE_COLOR_ONLINE_LOWPOWER,
     STATE_OFFLINE_NOPOWER: STATE_COLOR_OFFLINE_NOPOWER,
     STATE_OFFLINE_SAVING:  STATE_COLOR_OFFLINE_SAVING,
+    STATE_SUSPECT_NOPOWER: STATE_COLOR_SUSPECT_NOPOWER,
+    STATE_FETCH_ERROR: STATE_COLOR_FETCH_ERROR,
 }
 
 # Weather cloud-cover categories
@@ -492,6 +517,13 @@ if MEASUREMENT_SCHEDULE_MODE == "fixed":
     log.info("Sampling schedule mode: fixed times (%s)", fixed_times_text)
 else:
     log.info("Sampling schedule mode: cadence (%d minutes)", MEASUREMENT_CADENCE_MINUTES)
+log.info(
+    "Check target second configured/effective: %d/%d (complete_by_slot_end=%s, estimated_worst_case=%.1fs)",
+    CHECK_TARGET_SECOND,
+    EFFECTIVE_CHECK_TARGET_SECOND,
+    CHECK_COMPLETE_BY_SLOT_END,
+    _estimated_check_worst_case_seconds,
+)
 log.info("NWS weather station: %s", NWS_STATION)
 log.info("Include ASCII chart in Slack/webhook text: %s", SEND_ASCII_CHART_TO_SLACK)
 if INTRADAY_WEBHOOK_REPORT_MINUTES > 0:
@@ -831,6 +863,51 @@ def append_log(dt: datetime, state: str) -> None:
         writer.writerow([dt.strftime("%Y-%m-%d %H:%M:%S"), state])
 
 
+def rewrite_latest_state_in_csv(path: Path, expected_state: str, new_state: str) -> bool:
+    """Rewrite the latest CSV row state value when it matches expected_state."""
+    if not path.exists():
+        return False
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return False
+
+    header = rows[0]
+    if "state" in header:
+        state_idx = header.index("state")
+        data_start = 1
+    else:
+        state_idx = 1
+        data_start = 0
+
+    for row_idx in range(len(rows) - 1, data_start - 1, -1):
+        row = rows[row_idx]
+        if len(row) <= state_idx:
+            continue
+        if row[state_idx] != expected_state:
+            return False
+        row[state_idx] = new_state
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+        return True
+    return False
+
+
+def reclassify_previous_suspect_if_needed(previous_state: Optional[str], current_state: str) -> None:
+    """Reclassify the previous suspect sample as fetch error when follow-up rules match."""
+    if previous_state != STATE_SUSPECT_NOPOWER:
+        return
+    if current_state not in {STATE_ONLINE_OK, STATE_OFFLINE_NOPOWER}:
+        return
+
+    log_changed = rewrite_latest_state_in_csv(LOG_FILE, STATE_SUSPECT_NOPOWER, STATE_FETCH_ERROR)
+    diag_changed = rewrite_latest_state_in_csv(DIAGNOSTICS_FILE, STATE_SUSPECT_NOPOWER, STATE_FETCH_ERROR)
+    if log_changed or diag_changed:
+        log.info("Reclassified previous %s entry as %s", STATE_SUSPECT_NOPOWER, STATE_FETCH_ERROR)
+
+
 def append_diagnostics_log(dt: datetime, state: str, diagnostics: dict[str, str]) -> None:
     """Append a single stream-diagnostics record to a separate CSV log."""
     is_new = (not DIAGNOSTICS_FILE.exists()) or DIAGNOSTICS_FILE.stat().st_size == 0
@@ -992,6 +1069,8 @@ def get_daily_state_minutes(entries: list[tuple[datetime, str]], target_date) ->
         STATE_ONLINE_LOWPOWER: 0,
         STATE_OFFLINE_NOPOWER: 0,
         STATE_OFFLINE_SAVING: 0,
+        STATE_SUSPECT_NOPOWER: 0,
+        STATE_FETCH_ERROR: 0,
     }
     for slot_start, state in slots.items():
         minutes[state] = minutes.get(state, 0) + get_slot_duration_minutes(slot_start)
@@ -1171,7 +1250,9 @@ def build_intraday_report_content(now: Optional[datetime] = None) -> dict[str, s
         f"OK\t-\t{format_minutes_as_hours(today_minutes[STATE_ONLINE_OK])}\n"
         f"Power Saver\t-\t{format_minutes_as_hours(today_minutes[STATE_OFFLINE_SAVING])}\n"
         f"Low Power\t-\t{format_minutes_as_hours(today_minutes[STATE_ONLINE_LOWPOWER])}\n"
-        f"No Power\t-\t{format_minutes_as_hours(today_minutes[STATE_OFFLINE_NOPOWER])}\n\n"
+        f"No Power\t-\t{format_minutes_as_hours(today_minutes[STATE_OFFLINE_NOPOWER])}\n"
+        f"Suspect No Power\t-\t{format_minutes_as_hours(today_minutes[STATE_SUSPECT_NOPOWER])}\n"
+        f"Fetch Error\t-\t{format_minutes_as_hours(today_minutes[STATE_FETCH_ERROR])}\n\n"
         f"{expected_plain}\n"
         f"{no_power_progress_plain}"
     )
@@ -1189,6 +1270,8 @@ def build_intraday_report_content(now: Optional[datetime] = None) -> dict[str, s
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Power Saver</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_OFFLINE_SAVING])}</td></tr>
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Low Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_ONLINE_LOWPOWER])}</td></tr>
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_OFFLINE_NOPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Suspect No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_SUSPECT_NOPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Fetch Error</td><td style="padding: 4px 0;">{format_minutes_as_hours(today_minutes[STATE_FETCH_ERROR])}</td></tr>
     </table>
     <p style="margin: 0 0 8px 0;">{html.escape(expected_plain)}</p>
     <p style="margin: 0 0 16px 0;">{html.escape(no_power_progress_plain)}</p>
@@ -1219,6 +1302,8 @@ def build_daily_report_content(target_date=None) -> dict[str, str]:
         STATE_ONLINE_LOWPOWER: 0,
         STATE_OFFLINE_NOPOWER: 0,
         STATE_OFFLINE_SAVING: 0,
+        STATE_SUSPECT_NOPOWER: 0,
+        STATE_FETCH_ERROR: 0,
     }
     alert_sent = was_alert_sent_for_date(report_date)
     expected_power_minutes = get_expected_power_on_minutes(report_date)
@@ -1269,7 +1354,9 @@ def build_daily_report_content(target_date=None) -> dict[str, str]:
         f"OK\t-\t{format_minutes_as_hours(report_minutes[STATE_ONLINE_OK])}\n"
         f"Power Saver\t-\t{format_minutes_as_hours(report_minutes[STATE_OFFLINE_SAVING])}\n"
         f"Low Power\t-\t{format_minutes_as_hours(report_minutes[STATE_ONLINE_LOWPOWER])}\n"
-        f"No Power\t-\t{format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])}\n\n"
+        f"No Power\t-\t{format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])}\n"
+        f"Suspect No Power\t-\t{format_minutes_as_hours(report_minutes[STATE_SUSPECT_NOPOWER])}\n"
+        f"Fetch Error\t-\t{format_minutes_as_hours(report_minutes[STATE_FETCH_ERROR])}\n\n"
         f"{low_power_plain}\n"
         f"{no_power_plain}\n"
         f"{no_power_since_plain}"
@@ -1285,6 +1372,8 @@ def build_daily_report_content(target_date=None) -> dict[str, str]:
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Power Saver</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_OFFLINE_SAVING])}</td></tr>
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Low Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_ONLINE_LOWPOWER])}</td></tr>
       <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_OFFLINE_NOPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Suspect No Power</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_SUSPECT_NOPOWER])}</td></tr>
+      <tr><td style="padding: 4px 16px 4px 0; font-weight: 600;">Fetch Error</td><td style="padding: 4px 0;">{format_minutes_as_hours(report_minutes[STATE_FETCH_ERROR])}</td></tr>
     </table>
     <p style="margin: 0 0 8px 0;">{low_power_html}</p>
     <p style="margin: 0 0 16px 0;">{no_power_html}</p>
@@ -1503,6 +1592,8 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
       L = Online - Low Power
       X = Offline - No Power
       P = Offline - PowerSaving
+      S = Suspect - No Power
+      F = Fetch Error
       space = no data
 
     It is intended to be wrapped in a code block / preformatted block by
@@ -1521,6 +1612,8 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
         STATE_ONLINE_LOWPOWER: "L",
         STATE_OFFLINE_NOPOWER: "X",
         STATE_OFFLINE_SAVING: "P",
+        STATE_SUSPECT_NOPOWER: "S",
+        STATE_FETCH_ERROR: "F",
     }
 
     if MEASUREMENT_SCHEDULE_MODE == "cadence":
@@ -1536,7 +1629,7 @@ def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
         lines.append(f"{d:%m/%d/%Y} {row}".rstrip())
         d += timedelta(days=1)
 
-    lines.append("Legend: O=OK  X=NoPower  P=PowerSaver  L=LowPower")
+    lines.append("Legend: O=OK  X=NoPower  P=PowerSaver  L=LowPower  S=SuspectNoPower  F=FetchError")
 
     return "\n".join(lines)
 
@@ -1712,7 +1805,7 @@ def get_next_scheduled_check(after: Optional[datetime] = None) -> datetime:
         day = after.date() + timedelta(days=day_offset)
         day_start = datetime.combine(day, datetime.min.time())
         for minute_of_day in SCHEDULE_CHECK_MINUTES:
-            scheduled = day_start + timedelta(minutes=minute_of_day, seconds=CHECK_TARGET_SECOND)
+            scheduled = day_start + timedelta(minutes=minute_of_day, seconds=EFFECTIVE_CHECK_TARGET_SECOND)
             if scheduled > after:
                 return scheduled
     raise RuntimeError("Could not determine next scheduled check time.")
@@ -1919,6 +2012,8 @@ def generate_chart(days: int = DEFAULT_CHART_DAYS) -> None:
         mpatches.Patch(color=STATE_COLORS[STATE_ONLINE_LOWPOWER], label="Online - Low Power"),
         mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_NOPOWER], label="Offline - No Power"),
         mpatches.Patch(color=STATE_COLORS[STATE_OFFLINE_SAVING], label="Offline - PowerSaving"),
+        mpatches.Patch(color=STATE_COLORS[STATE_SUSPECT_NOPOWER], label="Suspect - No Power"),
+        mpatches.Patch(color=STATE_COLORS[STATE_FETCH_ERROR], label="Fetch Error"),
         mlines.Line2D(
             [],
             [],
@@ -2002,7 +2097,16 @@ def run_once(now: Optional[datetime] = None) -> str:
     """Perform a single check, log it, regenerate the chart, and return state."""
     if now is None:
         now = datetime.now()
+    entries_before = read_log()
+    previous_state = entries_before[-1][1] if entries_before else None
+
     state, diagnostics = determine_state(now)
+    reclassify_previous_suspect_if_needed(previous_state, state)
+
+    if state == STATE_OFFLINE_NOPOWER and previous_state in {STATE_ONLINE_OK, STATE_ONLINE_LOWPOWER}:
+        state = STATE_SUSPECT_NOPOWER
+        log.info("State marked as %s due to preceding %s", STATE_SUSPECT_NOPOWER, previous_state)
+
     append_log(now, state)
     append_diagnostics_log(now, state, diagnostics)
     log.info("State: %s", state)

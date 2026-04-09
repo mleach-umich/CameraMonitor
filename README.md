@@ -4,7 +4,7 @@ Monitor and report the status of the UMCI construction camera.
 
 This project:
 - checks the camera stream on a configurable schedule
-- classifies each sample as `Online - OK`, `Online - Low Power`, `Offline - No Power`, or `Offline - PowerSaving`
+- classifies each sample as `Online - OK`, `Online - Low Power`, `Offline - No Power`, `Offline - PowerSaving`, `Suspect - No Power`, or `Fetch Error`
 - records cloud-cover observations from NOAA/NWS by station (default: `KDTW`)
 - logs results to CSV
 - generates a 14-day timeline chart
@@ -105,7 +105,9 @@ NO_POWER_ALERT_THRESHOLD_FRACTION=0.33
 FFMPEG_TIMEOUT_SECONDS=20
 STREAM_CHECK_TIMEOUT_SECONDS=10
 STREAM_CHECK_RETRIES=2
-STREAM_CHECK_RETRY_DELAY_SECONDS=2.0
+STREAM_CHECK_RETRY_DELAY_SECONDS=4.0
+CHECK_COMPLETE_BY_SLOT_END=true
+CHECK_COMPLETION_BUFFER_SECONDS=2.0
 NWS_STATION=KDTW
 NWS_API_BASE_URL=https://api.weather.gov
 NWS_REQUEST_TIMEOUT_SECONDS=10
@@ -114,6 +116,8 @@ STATE_COLOR_ONLINE_OK=#22c55e
 STATE_COLOR_ONLINE_LOWPOWER=#eab308
 STATE_COLOR_OFFLINE_NOPOWER=#ef4444
 STATE_COLOR_OFFLINE_SAVING=#c0c0c0
+STATE_COLOR_SUSPECT_NOPOWER=#000000
+STATE_COLOR_FETCH_ERROR=#000000
 CHART_TEXT_COLOR=#111827
 CHART_TITLE_COLOR=#111827
 CHART_TITLE_FONT_SIZE=13.0
@@ -169,8 +173,11 @@ Tuning notes:
 - `MEASUREMENT_CADENCE_MINUTES` allows only: `15`, `30`, `60`, `120`, `240`, `480`.
 - `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.
 - `STREAM_CHECK_RETRIES` and `STREAM_CHECK_RETRY_DELAY_SECONDS` reduce false `Offline - No Power` events during brief network hiccups.
+- `CHECK_COMPLETE_BY_SLOT_END=true` and `CHECK_COMPLETION_BUFFER_SECONDS` start checks earlier when needed so retries can complete before slot-end.
 - `NWS_STATION` sets the weather station used for cloud cover (`KDTW` is Detroit Metro Airport).
-- `STATE_COLOR_*` variables control the four status band colors for online/offline conditions.
+- `STATE_COLOR_*` variables control status band colors, including `STATE_COLOR_SUSPECT_NOPOWER` and `STATE_COLOR_FETCH_ERROR` for fetch-anomaly states.
+- If a `No Power` sample follows `Online - OK` or `Online - Low Power`, it is marked `Suspect - No Power`.
+- If the next sample after a suspect entry is `Online - OK` or `Offline - No Power`, the suspect entry is retroactively reclassified as `Fetch Error`.
 - The chart draws weather icons at cloud-cover change points, with a colored line centered in each status band showing duration by condition.
 - `CHART_TEXT_COLOR` applies to x/y tick labels and legend text.
 - `CHART_TITLE_TEXT`, `CHART_TITLE_COLOR`, and `CHART_TITLE_FONT_SIZE` control the chart title.
