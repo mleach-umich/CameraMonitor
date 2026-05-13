@@ -156,19 +156,24 @@ SLACK_REPORT_NAME=UMCI Camera Monitor
 SEND_ASCII_CHART_TO_SLACK=false
 INTRADAY_WEBHOOK_REPORT_MINUTES=0
 
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USE_TLS=true
-SMTP_USERNAME=youraccount@gmail.com
-SMTP_PASSWORD=your-app-password
-EMAIL_FROM=youraccount@gmail.com
-EMAIL_TO=recipient@example.com
+SMTP_HOST=mail-relay.itd.umich.edu
+SMTP_PORT=25
+SMTP_USE_TLS=false
+SMTP_AUTH_REQUIRED=false
+SMTP_USERNAME=
+SMTP_PASSWORD=
+EMAIL_FROM=MonitorUMCICam@umich.edu
+EMAIL_FROM_NAME=MonitorUMCICam
+EMAIL_ENVELOPE_FROM=MonitorUMCICam@umich.edu
+EMAIL_TO=MonitorUMCICam@umich.edu
 
 LAMBDA_WEBHOOK_URL=https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook
 ```
 
 Tuning notes:
 - Stream URL/site location and email/webhook transport settings are intentionally stored in `.env.secret`.
+- U-M ITS Mail Relay expects the sending host/IP to be registered with ITS. The app supports unauthenticated relay by leaving `SMTP_USERNAME` and `SMTP_PASSWORD` empty.
+- `EMAIL_FROM_NAME` controls the display name in the From header, while `EMAIL_ENVELOPE_FROM` controls the SMTP envelope sender.
 - `MEASUREMENT_SCHEDULE_MODE` supports `cadence` or `fixed`.
 - `MEASUREMENT_CADENCE_MINUTES` allows only: `15`, `30`, `60`, `120`, `240`, `480`.
 - `MEASUREMENT_FIXED_TIMES` accepts up to 4 comma-separated `HH:MM` values (24-hour), for example `06:00,12:00,18:00,22:30`.

@@ -48,6 +48,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import formataddr
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -341,8 +342,11 @@ SMTP_PORT = get_env_int("SMTP_PORT", 587, min_value=1, max_value=65535)
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").strip()
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USERNAME).strip()
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "").strip()
+EMAIL_ENVELOPE_FROM = os.environ.get("EMAIL_ENVELOPE_FROM", EMAIL_FROM).strip()
 EMAIL_TO = os.environ.get("EMAIL_TO", "").strip()
 SMTP_USE_TLS = os.environ.get("SMTP_USE_TLS", "true").strip().lower() not in {"0", "false", "no"}
+SMTP_AUTH_REQUIRED = get_env_bool("SMTP_AUTH_REQUIRED", False)
 LAMBDA_WEBHOOK_URL = os.environ.get(
     "LAMBDA_WEBHOOK_URL",
     "https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook",
@@ -1462,12 +1466,25 @@ def send_daily_report(days: int = 1) -> None:
     slack_upload_file(LOG_FILE, f"{SLACK_REPORT_NAME} log")
 
 
+def is_email_configured() -> bool:
+    """Return true when the minimum SMTP relay settings are present."""
+    return bool(SMTP_HOST and EMAIL_FROM and EMAIL_TO)
+
+
+def get_email_from_header() -> str:
+    """Build a From header with an optional display name."""
+    if EMAIL_FROM_NAME:
+        return formataddr((EMAIL_FROM_NAME, EMAIL_FROM))
+    return EMAIL_FROM
+
+
 def send_email_with_attachments(subject: str, plain_body: str, html_body: str, attachments: list[Path]) -> None:
     """Send an email with attachments via SMTP."""
-    if not SMTP_HOST or not SMTP_USERNAME or not SMTP_PASSWORD or not EMAIL_FROM or not EMAIL_TO:
-        raise RuntimeError(
-            "Set SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, and EMAIL_TO before sending email reports"
-        )
+    if not is_email_configured():
+        raise RuntimeError("Set SMTP_HOST, EMAIL_FROM, and EMAIL_TO before sending email reports")
+    should_authenticate = SMTP_AUTH_REQUIRED or bool(SMTP_USERNAME or SMTP_PASSWORD)
+    if should_authenticate and not (SMTP_USERNAME and SMTP_PASSWORD):
+        raise RuntimeError("Set both SMTP_USERNAME and SMTP_PASSWORD, or disable SMTP_AUTH_REQUIRED")
     recipients = [addr.strip() for addr in EMAIL_TO.split(",") if addr.strip()]
     if not recipients:
         raise RuntimeError("EMAIL_TO must contain at least one recipient email address")
@@ -1475,7 +1492,7 @@ def send_email_with_attachments(subject: str, plain_body: str, html_body: str, a
 
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
+    msg["From"] = get_email_from_header()
     msg["To"] = ", ".join(recipients)
     msg.set_content(plain_body)
     msg.add_alternative(html_body, subtype="html")
@@ -1512,8 +1529,9 @@ def send_email_with_attachments(subject: str, plain_body: str, html_body: str, a
         if SMTP_USE_TLS:
             server.starttls()
             server.ehlo()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg, to_addrs=recipients)
+        if should_authenticate:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+        server.send_message(msg, from_addr=EMAIL_ENVELOPE_FROM or EMAIL_FROM, to_addrs=recipients)
     log.info("Email report sent successfully")
 
 
@@ -1559,7 +1577,7 @@ def send_no_power_alert(target_date, no_power_minutes: int, expected_power_minut
     """Send the one-per-day no-power alert through email and webhook."""
     alert_content = build_alert_content(target_date, no_power_minutes, expected_power_minutes)
 
-    if SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and EMAIL_FROM and EMAIL_TO:
+    if is_email_configured():
         subject = f"ALERT: {SLACK_REPORT_NAME} power failure - {target_date:%Y-%m-%d}"
         send_email_with_attachments(subject, alert_content["plain"], alert_content["html"], [])
 
@@ -1833,7 +1851,7 @@ def maybe_send_end_of_day_report(now: datetime) -> None:
     if read_last_reported_date() == report_date:
         return
 
-    if SMTP_HOST and SMTP_USERNAME and SMTP_PASSWORD and EMAIL_FROM and EMAIL_TO:
+    if is_email_configured():
         send_daily_email_report(report_date=now.date())
     if LAMBDA_WEBHOOK_URL:
         send_daily_webhook_report(report_date=now.date())
