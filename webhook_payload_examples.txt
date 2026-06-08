@@ -12,7 +12,28 @@ The values below are representative examples.
   "event": "daily_report",
   "report_date": "2026-03-30",
   "text": "UMCI Camera Monitor daily report for 2026-03-30\n\nOK               -  02:30 HR\nPower Saver      -  10:30 HR\nLow Power        -  09:15 HR\nNo Power         -  00:00 HR\n\nThere were 15 minutes less low power time than yesterday.\nThere were 0 minutes the same as yesterday of no power time.\nIt has been 18:45 since the last no power event.",
-  "html": "<html><body style=\"font-family: Arial, sans-serif; color: #222;\"><h2 style=\"margin-bottom: 8px;\">UMCI Camera Monitor daily report for 2026-03-30</h2><table style=\"border-collapse: collapse; margin-bottom: 16px;\"><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">OK</td><td style=\"padding: 4px 0;\">02:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Power Saver</td><td style=\"padding: 4px 0;\">10:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Low Power</td><td style=\"padding: 4px 0;\">09:15 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">No Power</td><td style=\"padding: 4px 0;\">00:00 HR</td></tr></table><p style=\"margin: 0 0 8px 0;\"><span style=\"color: #2e7d32; font-weight: 600;\">There were 15 minutes less low power time than yesterday.</span></p><p style=\"margin: 0 0 16px 0;\"><span style=\"color: #333333; font-weight: 600;\">There were 0 minutes the same as yesterday of no power time.</span></p><p style=\"margin: 0 0 16px 0;\">It has been 18:45 since the last no power event.</p><img src=\"cid:webcam_chart_inline\" alt=\"Webcam status chart\" style=\"max-width: 100%; height: auto; border: 1px solid #ddd;\" /></body></html>"
+  "html": "<html><body style=\"font-family: Arial, sans-serif; color: #222;\"><h2 style=\"margin-bottom: 8px;\">UMCI Camera Monitor daily report for 2026-03-30</h2><table style=\"border-collapse: collapse; margin-bottom: 16px;\"><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">OK</td><td style=\"padding: 4px 0;\">02:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Power Saver</td><td style=\"padding: 4px 0;\">10:30 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">Low Power</td><td style=\"padding: 4px 0;\">09:15 HR</td></tr><tr><td style=\"padding: 4px 16px 4px 0; font-weight: 600;\">No Power</td><td style=\"padding: 4px 0;\">00:00 HR</td></tr></table><p style=\"margin: 0 0 8px 0;\"><span style=\"color: #2e7d32; font-weight: 600;\">There were 15 minutes less low power time than yesterday.</span></p><p style=\"margin: 0 0 16px 0;\"><span style=\"color: #333333; font-weight: 600;\">There were 0 minutes the same as yesterday of no power time.</span></p><p style=\"margin: 0 0 16px 0;\">It has been 18:45 since the last no power event.</p><img src=\"cid:webcam_chart_inline\" alt=\"Webcam status chart\" style=\"max-width: 100%; height: auto; border: 1px solid #ddd;\" /></body></html>",
+  "chart_image_base64_png": "iVBORw0KGgo...",
+  "attachments": [
+    {
+      "title": "UMCI Camera Monitor chart",
+      "filename": "webcam_status_chart.png",
+      "mime_type": "image/png",
+      "content_base64": "iVBORw0KGgo..."
+    },
+    {
+      "title": "UMCI Camera Monitor log",
+      "filename": "webcam_log.csv",
+      "mime_type": "text/csv",
+      "content_base64": "VGltZXN0YW1wLFN0YXRlCg..."
+    },
+    {
+      "title": "UMCI Camera Monitor diagnostics",
+      "filename": "webcam_stream_diagnostics.csv",
+      "mime_type": "text/csv",
+      "content_base64": "VGltZXN0YW1wLFN0YXRlCg..."
+    }
+  ]
 }
 
 

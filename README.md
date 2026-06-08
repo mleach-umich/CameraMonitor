@@ -112,6 +112,14 @@ NWS_STATION=KDTW
 NWS_API_BASE_URL=https://api.weather.gov
 NWS_REQUEST_TIMEOUT_SECONDS=10
 NWS_USER_AGENT=UMCI Camera Monitor (mikelch@umich.edu)
+SEND_DAILY_EMAIL_REPORT=true
+SEND_DAILY_WEBHOOK_REPORT=true
+DAILY_EMAIL_ATTACH_CHART=true
+DAILY_EMAIL_ATTACH_LOG=false
+DAILY_EMAIL_ATTACH_DIAGNOSTICS=false
+DAILY_WEBHOOK_ATTACH_CHART=true
+DAILY_WEBHOOK_ATTACH_LOG=true
+DAILY_WEBHOOK_ATTACH_DIAGNOSTICS=true
 STATE_COLOR_ONLINE_OK=#22c55e
 STATE_COLOR_ONLINE_LOWPOWER=#eab308
 STATE_COLOR_OFFLINE_NOPOWER=#ef4444
@@ -195,6 +203,10 @@ Tuning notes:
 - Weather colors are tunable via `WEATHER_COLOR_*` hex values.
 - `CHART_BACKGROUND_COLOR` controls the chart canvas/background color.
 - `WEATHER_SHOW_DURING_POWERSAVING=false` hides weather overlays in `Offline - PowerSaving` periods while continuing to log weather each sample.
+- `SEND_DAILY_EMAIL_REPORT=false` disables daily email reports even when SMTP is configured.
+- `SEND_DAILY_WEBHOOK_REPORT=false` disables daily webhook reports even when `LAMBDA_WEBHOOK_URL` is configured.
+- `DAILY_EMAIL_ATTACH_CHART`, `DAILY_EMAIL_ATTACH_LOG`, and `DAILY_EMAIL_ATTACH_DIAGNOSTICS` control which files are attached to daily email reports.
+- `DAILY_WEBHOOK_ATTACH_CHART`, `DAILY_WEBHOOK_ATTACH_LOG`, and `DAILY_WEBHOOK_ATTACH_DIAGNOSTICS` control which files are included in daily webhook payload attachments.
 - `SEND_ASCII_CHART_TO_SLACK=false` keeps ASCII chart blocks out of Slack/webhook message text by default.
 - `INTRADAY_WEBHOOK_REPORT_MINUTES` sends periodic intra-day webhook updates (set `0` to disable).
 - Webhook HTML has email-only `cid:` inline images removed to avoid Slack block conversion errors.
@@ -210,7 +222,7 @@ The daily email includes:
 - comparison against the previous day
 - time since the last no-power event
 - the chart inline in the HTML body
-- attachments for the chart and logs
+- optional attachments controlled by `DAILY_EMAIL_ATTACH_*`
 
 Manual test:
 
@@ -231,6 +243,7 @@ LAMBDA_WEBHOOK_URL=https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/w
 The nightly webhook report includes:
 - plain-text summary
 - HTML summary
+- optional base64 file attachments controlled by `DAILY_WEBHOOK_ATTACH_*`
 - optional ASCII chart block (enabled only when `SEND_ASCII_CHART_TO_SLACK=true`)
 - optional extra fields depending on current development
 

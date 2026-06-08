@@ -352,6 +352,14 @@ LAMBDA_WEBHOOK_URL = os.environ.get(
     "https://khgcza01c8.execute-api.us-east-1.amazonaws.com/Prod/webhook",
 ).strip()
 SEND_ASCII_CHART_TO_SLACK = get_env_bool("SEND_ASCII_CHART_TO_SLACK", False)
+SEND_DAILY_EMAIL_REPORT = get_env_bool("SEND_DAILY_EMAIL_REPORT", True)
+SEND_DAILY_WEBHOOK_REPORT = get_env_bool("SEND_DAILY_WEBHOOK_REPORT", True)
+DAILY_EMAIL_ATTACH_CHART = get_env_bool("DAILY_EMAIL_ATTACH_CHART", True)
+DAILY_EMAIL_ATTACH_LOG = get_env_bool("DAILY_EMAIL_ATTACH_LOG", True)
+DAILY_EMAIL_ATTACH_DIAGNOSTICS = get_env_bool("DAILY_EMAIL_ATTACH_DIAGNOSTICS", True)
+DAILY_WEBHOOK_ATTACH_CHART = get_env_bool("DAILY_WEBHOOK_ATTACH_CHART", True)
+DAILY_WEBHOOK_ATTACH_LOG = get_env_bool("DAILY_WEBHOOK_ATTACH_LOG", False)
+DAILY_WEBHOOK_ATTACH_DIAGNOSTICS = get_env_bool("DAILY_WEBHOOK_ATTACH_DIAGNOSTICS", False)
 INTRADAY_WEBHOOK_REPORT_MINUTES = get_env_int(
     "INTRADAY_WEBHOOK_REPORT_MINUTES",
     0,
@@ -530,6 +538,20 @@ log.info(
 )
 log.info("NWS weather station: %s", NWS_STATION)
 log.info("Include ASCII chart in Slack/webhook text: %s", SEND_ASCII_CHART_TO_SLACK)
+log.info("Daily email reports enabled: %s", SEND_DAILY_EMAIL_REPORT)
+log.info(
+    "Daily email attachments: chart=%s log=%s diagnostics=%s",
+    DAILY_EMAIL_ATTACH_CHART,
+    DAILY_EMAIL_ATTACH_LOG,
+    DAILY_EMAIL_ATTACH_DIAGNOSTICS,
+)
+log.info("Daily webhook reports enabled: %s", SEND_DAILY_WEBHOOK_REPORT)
+log.info(
+    "Daily webhook attachments: chart=%s log=%s diagnostics=%s",
+    DAILY_WEBHOOK_ATTACH_CHART,
+    DAILY_WEBHOOK_ATTACH_LOG,
+    DAILY_WEBHOOK_ATTACH_DIAGNOSTICS,
+)
 if INTRADAY_WEBHOOK_REPORT_MINUTES > 0:
     log.info("Intra-day webhook reports: enabled every %d minutes", INTRADAY_WEBHOOK_REPORT_MINUTES)
 else:
@@ -1537,15 +1559,25 @@ def send_email_with_attachments(subject: str, plain_body: str, html_body: str, a
 
 def send_daily_email_report(days: int = 1, report_date=None) -> None:
     """Generate the chart and email a summary, chart, and logs."""
+    if not SEND_DAILY_EMAIL_REPORT:
+        log.info("Skipping daily email report because SEND_DAILY_EMAIL_REPORT=false")
+        return
     generate_chart(days=DEFAULT_CHART_DAYS)
     report_content = build_daily_report_content(target_date=report_date)
     subject_date = report_date if report_date is not None else datetime.now().date()
     subject = f"{SLACK_REPORT_NAME} daily report - {subject_date.strftime('%Y-%m-%d')}"
+    attachments = []
+    if DAILY_EMAIL_ATTACH_CHART:
+        attachments.append(CHART_FILE)
+    if DAILY_EMAIL_ATTACH_LOG:
+        attachments.append(LOG_FILE)
+    if DAILY_EMAIL_ATTACH_DIAGNOSTICS:
+        attachments.append(DIAGNOSTICS_FILE)
     send_email_with_attachments(
         subject,
         report_content["plain"],
         report_content["html"],
-        [CHART_FILE, LOG_FILE, DIAGNOSTICS_FILE],
+        attachments,
     )
 
 
@@ -1600,6 +1632,40 @@ def build_chart_base64() -> Optional[str]:
     if not CHART_FILE.exists():
         return None
     return base64.b64encode(CHART_FILE.read_bytes()).decode("ascii")
+
+
+def build_webhook_attachment(path: Path, title: str) -> Optional[dict[str, str]]:
+    """Return a base64-encoded file attachment payload, if available."""
+    if not path.exists():
+        log.warning("Skipping missing webhook attachment: %s", path)
+        return None
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+    return {
+        "title": title,
+        "filename": path.name,
+        "mime_type": mime_type,
+        "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+    }
+
+
+def build_daily_webhook_attachments() -> list[dict[str, str]]:
+    """Build selected daily report attachment payloads for the webhook."""
+    attachment_specs = []
+    if DAILY_WEBHOOK_ATTACH_CHART:
+        attachment_specs.append((CHART_FILE, f"{SLACK_REPORT_NAME} chart"))
+    if DAILY_WEBHOOK_ATTACH_LOG:
+        attachment_specs.append((LOG_FILE, f"{SLACK_REPORT_NAME} log"))
+    if DAILY_WEBHOOK_ATTACH_DIAGNOSTICS:
+        attachment_specs.append((DIAGNOSTICS_FILE, f"{SLACK_REPORT_NAME} diagnostics"))
+
+    attachments = []
+    for path, title in attachment_specs:
+        attachment = build_webhook_attachment(path, title)
+        if attachment:
+            attachments.append(attachment)
+    return attachments
 
 
 def build_chart_ascii(days: int = DEFAULT_CHART_DAYS) -> Optional[str]:
@@ -1688,6 +1754,9 @@ def sanitize_webhook_html(html_body: str) -> str:
 
 def send_daily_webhook_report(report_date=None) -> None:
     """Send the nightly report body to the lab data webhook."""
+    if not SEND_DAILY_WEBHOOK_REPORT:
+        log.info("Skipping daily webhook report because SEND_DAILY_WEBHOOK_REPORT=false")
+        return
     report_content = build_daily_report_content(target_date=report_date)
     chart_ascii = build_chart_ascii() if SEND_ASCII_CHART_TO_SLACK else None
     text_body = report_content["plain"]
@@ -1709,8 +1778,12 @@ def send_daily_webhook_report(report_date=None) -> None:
         "report_date": (report_date or datetime.now().date()).isoformat(),
         "text": text_body,
         "html": html_body,
-        "chart_image_base64_png": build_chart_base64(),
     }
+    if DAILY_WEBHOOK_ATTACH_CHART:
+        payload["chart_image_base64_png"] = build_chart_base64()
+    attachments = build_daily_webhook_attachments()
+    if attachments:
+        payload["attachments"] = attachments
     if chart_ascii and SEND_ASCII_CHART_TO_SLACK:
         payload["chart_ascii_art"] = chart_ascii
     post_lambda_webhook(payload)
@@ -1851,9 +1924,9 @@ def maybe_send_end_of_day_report(now: datetime) -> None:
     if read_last_reported_date() == report_date:
         return
 
-    if is_email_configured():
+    if SEND_DAILY_EMAIL_REPORT and is_email_configured():
         send_daily_email_report(report_date=now.date())
-    if LAMBDA_WEBHOOK_URL:
+    if SEND_DAILY_WEBHOOK_REPORT and LAMBDA_WEBHOOK_URL:
         send_daily_webhook_report(report_date=now.date())
     write_last_reported_date(report_date)
 
